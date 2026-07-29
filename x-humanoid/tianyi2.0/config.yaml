@@ -1,4 +1,4 @@
-mcp_port: 15707
+mcp_port: 15799
 ros_namespace: ""   # 留空则自动使用 hostname
 name: "Tianyi2-SDL"
 

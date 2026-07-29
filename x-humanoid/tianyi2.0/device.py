@@ -25,6 +25,8 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
+  PowerThermalPlugin (sensor)           — 电源板温度监控
+  ChassisSafetyPlugin (sensor)          — 底盘安全检测
 """
 
 import json
@@ -603,6 +605,130 @@ class NavStatePlugin:
             except Exception:
                 pass
             time.sleep(0.5)  # 2Hz
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PowerThermalPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PowerThermalPlugin:
+    """电源板温度监控 — 腰/臂/腿 MOS 温度 + 电流/电压"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/power"
+        self._running = False
+
+        self._sub_node = Node("tianyi2_power_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_power_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "power_thermal",
+            "type": "sensor",
+            "description": "天轶2.0 电源板温度 — 腰部/双臂/双腿 MOS温度 + 电流/电压",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import PowerBoardStatus
+            self._sub_node.create_subscription(
+                PowerBoardStatus, "/power/board/status", self._on_power_status, _RELIABLE_QOS)
+            print("[PowerThermalPlugin] subscription created")
+        except ImportError as e:
+            print(f"[PowerThermalPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    def _on_power_status(self, msg):
+        if not self._running:
+            return
+        try:
+            data = {
+                "waist_temp": getattr(msg, "waist_temp", 0),
+                "arm_a_temp": getattr(msg, "arm_a_temp", 0),
+                "arm_b_temp": getattr(msg, "arm_b_temp", 0),
+                "leg_a_temp": getattr(msg, "leg_a_temp", 0),
+                "leg_b_temp": getattr(msg, "leg_b_temp", 0),
+                "arm_a_curr": getattr(msg, "arm_a_curr", 0),
+                "arm_b_curr": getattr(msg, "arm_b_curr", 0),
+                "bus_volt": getattr(msg, "bus_volt", 0),
+            }
+            out = String()
+            out.data = json.dumps(data)
+            self._pub.publish(out)
+        except Exception as e:
+            print(f"[PowerThermalPlugin] publish error: {e}", flush=True)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ChassisSafetyPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChassisSafetyPlugin:
+    """底盘安全检测 — 碰撞/磁感/悬崖检测 (轮询 Slamtec API)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._topic = f"/{namespace}/state/safety"
+        self._running = False
+
+        self._pub_node = Node("tianyi2_safety_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "chassis_safety",
+            "type": "sensor",
+            "description": "天轶2.0 底盘安全检测 — 碰撞/磁感/悬崖状态 (Slamtec底盘)",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        print("[ChassisSafetyPlugin] polling started")
+
+    def stop(self):
+        self._running = False
+
+    def _poll_loop(self):
+        while self._running:
+            try:
+                data = self._slamtec.get_safety_status()
+                if data:
+                    msg = String()
+                    msg.data = json.dumps(data)
+                    self._pub.publish(msg)
+            except Exception:
+                pass
+            time.sleep(0.2)  # 5Hz
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):

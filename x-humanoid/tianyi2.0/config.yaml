@@ -28,3 +28,7 @@ plugins:
     enabled: true
   chat:
     enabled: true
+  power_thermal:
+    enabled: true
+  chassis_safety:
+    enabled: true

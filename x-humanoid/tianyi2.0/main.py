@@ -152,6 +152,16 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
+        if plugins_cfg.get("power_thermal", {}).get("enabled", False):
+            from device import PowerThermalPlugin
+            self._plugins.append(PowerThermalPlugin(plugins_cfg["power_thermal"], namespace, ros2))
+            print("[bundle] PowerThermalPlugin loaded")
+
+        if plugins_cfg.get("chassis_safety", {}).get("enabled", False):
+            from device import ChassisSafetyPlugin
+            self._plugins.append(ChassisSafetyPlugin(plugins_cfg["chassis_safety"], namespace, ros2, slamtec_client))
+            print("[bundle] ChassisSafetyPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

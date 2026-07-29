@@ -158,6 +158,21 @@ class SlamtecClient:
             "options": {"gohome_options": {"flags": "dock"}},
         })
 
+    # ── Safety ────────────────────────────────────────────────────────────────
+
+    def get_safety_status(self) -> dict:
+        """获取底盘安全状态 — 碰撞/磁感/悬崖检测"""
+        health = self.get_robot_health()
+        power = self.get_power_status()
+        return {
+            "collision": health.get("collision", False),
+            "magnetic": health.get("magnetic", {}),
+            "cliff": health.get("cliff", {}),
+            "bumper": health.get("bumper", {}),
+            "charging": power.get("is_charging", False),
+            "battery": power.get("battery_percentage", 0),
+        }
+
     # ── System ────────────────────────────────────────────────────────────────
 
     def get_power_status(self) -> dict:

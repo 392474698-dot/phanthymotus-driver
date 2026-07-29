@@ -152,10 +152,20 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
-        if plugins_cfg.get("power_thermal", {}).get("enabled", False):
-            from device import PowerThermalPlugin
-            self._plugins.append(PowerThermalPlugin(plugins_cfg["power_thermal"], namespace, ros2))
-            print("[bundle] PowerThermalPlugin loaded")
+        if plugins_cfg.get("imu", {}).get("enabled", False):
+            from device import ImuPlugin
+            self._plugins.append(ImuPlugin(plugins_cfg["imu"], namespace, ros2))
+            print("[bundle] ImuPlugin loaded")
+
+        if plugins_cfg.get("motor_alarm", {}).get("enabled", False):
+            from device import MotorAlarmPlugin
+            self._plugins.append(MotorAlarmPlugin(plugins_cfg["motor_alarm"], namespace, ros2))
+            print("[bundle] MotorAlarmPlugin loaded")
+
+        if plugins_cfg.get("exception", {}).get("enabled", False):
+            from device import ExceptionPlugin
+            self._plugins.append(ExceptionPlugin(plugins_cfg["exception"], namespace, ros2))
+            print("[bundle] ExceptionPlugin loaded")
 
         if plugins_cfg.get("chassis_safety", {}).get("enabled", False):
             from device import ChassisSafetyPlugin

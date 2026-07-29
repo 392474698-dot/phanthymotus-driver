@@ -28,7 +28,11 @@ plugins:
     enabled: true
   chat:
     enabled: true
-  power_thermal:
+  imu:
+    enabled: true
+  motor_alarm:
+    enabled: true
+  exception:
     enabled: true
   chassis_safety:
     enabled: true

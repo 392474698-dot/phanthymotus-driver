@@ -25,7 +25,9 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
-  PowerThermalPlugin (sensor)           — 电源板温度监控
+  ImuPlugin        (sensor)             — 姿态传感器 (加速度+角速度)
+  MotorAlarmPlugin (sensor)             — 电机异常报警
+  ExceptionPlugin  (sensor)             — 系统异常
   ChassisSafetyPlugin (sensor)          — 底盘安全检测
 """
 
@@ -614,30 +616,30 @@ class NavStatePlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PowerThermalPlugin (sensor)
+# ImuPlugin (sensor)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class PowerThermalPlugin:
-    """电源板温度监控 — 腰/臂/腿 MOS 温度 + 电流/电压"""
+class ImuPlugin:
+    """姿态传感器 — 三轴加速度 + 三轴角速度，摔倒/碰撞检测"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._topic = f"/{namespace}/state/power"
+        self._topic = f"/{namespace}/state/imu"
         self._running = False
 
-        self._sub_node = Node("tianyi2_power_sub", context=ros2.ctx_tianyi)
+        self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
-        self._pub_node = Node("tianyi2_power_pub", context=ros2.ctx_core)
+        self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
 
     def get_tool(self) -> dict:
         return {
-            "name": "power_thermal",
+            "name": "imu",
             "type": "sensor",
-            "description": "天轶2.0 电源板温度 — 腰部/双臂/双腿 MOS温度 + 电流/电压",
+            "description": "天轶2.0 姿态传感器 — 加速度/角速度 (摔倒/碰撞检测)",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
@@ -645,40 +647,162 @@ class PowerThermalPlugin:
     def start(self):
         self._running = True
         try:
-            from bodyctrl_msgs.msg import PowerStatus
+            from bodyctrl_msgs.msg import Imu as ImuMsg
             self._sub_node.create_subscription(
-                PowerStatus, "/power/board/status", self._on_power_status, _RELIABLE_QOS)
-            print("[PowerThermalPlugin] subscription created")
+                ImuMsg, "/imu", self._on_imu, _LOW_LAT_QOS)
+            print("[ImuPlugin] subscription created")
         except ImportError as e:
-            print(f"[PowerThermalPlugin] WARNING: msg import failed ({e})")
+            print(f"[ImuPlugin] WARNING: msg import failed ({e})")
 
     def stop(self):
         self._running = False
 
-    def _on_power_status(self, msg):
+    def _on_imu(self, msg):
         if not self._running:
             return
         try:
             data = {
-                "waist_temp": getattr(msg, "waist_temp", 0),
-                "arm_a_temp": getattr(msg, "arm_a_temp", 0),
-                "arm_b_temp": getattr(msg, "arm_b_temp", 0),
-                "leg_a_temp": getattr(msg, "leg_a_temp", 0),
-                "leg_b_temp": getattr(msg, "leg_b_temp", 0),
-                "arm_a_curr": getattr(msg, "arm_a_curr", 0),
-                "arm_b_curr": getattr(msg, "arm_b_curr", 0),
-                "bus_volt": getattr(msg, "bus_volt", 0),
+                "accel_x": getattr(msg, "accel_x", 0.0),
+                "accel_y": getattr(msg, "accel_y", 0.0),
+                "accel_z": getattr(msg, "accel_z", 0.0),
+                "gyro_x": getattr(msg, "gyro_x", 0.0),
+                "gyro_y": getattr(msg, "gyro_y", 0.0),
+                "gyro_z": getattr(msg, "gyro_z", 0.0),
             }
             out = String()
             out.data = json.dumps(data)
             self._pub.publish(out)
         except Exception as e:
-            print(f"[PowerThermalPlugin] publish error: {e}", flush=True)
+            print(f"[ImuPlugin] publish error: {e}", flush=True)
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("start", "stop", "info"):
-            return {"state": "running" if self._running else "idle",
-                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MotorAlarmPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MotorAlarmPlugin:
+    """电机异常报警 — 21个电机的具体异常码"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/alarm"
+        self._running = False
+
+        self._sub_node = Node("tianyi2_alarm_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_alarm_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "motor_alarm",
+            "type": "sensor",
+            "description": "天轶2.0 电机异常报警 — 21个电机的具体异常码",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import AlarmArray
+            self._sub_node.create_subscription(
+                AlarmArray, "/alarm", self._on_alarm, _RELIABLE_QOS)
+            print("[MotorAlarmPlugin] subscription created")
+        except ImportError as e:
+            print(f"[MotorAlarmPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    def _on_alarm(self, msg):
+        if not self._running:
+            return
+        try:
+            alarms = []
+            alarm_list = getattr(msg, "alarm", [])
+            for a in alarm_list:
+                alarms.append({
+                    "motor_id": getattr(a, "motor_id", 0),
+                    "error_code": getattr(a, "error_code", 0),
+                    "error_msg": getattr(a, "error_msg", ""),
+                })
+            out = String()
+            out.data = json.dumps({"alarms": alarms})
+            self._pub.publish(out)
+        except Exception as e:
+            print(f"[MotorAlarmPlugin] publish error: {e}", flush=True)
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ExceptionPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExceptionPlugin:
+    """系统异常 — 过温/过流/欠压等系统级异常"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._topic = f"/{namespace}/state/exception"
+        self._running = False
+
+        self._sub_node = Node("tianyi2_exception_sub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._sub_node)
+
+        self._pub_node = Node("tianyi2_exception_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _RELIABLE_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "exception",
+            "type": "sensor",
+            "description": "天轶2.0 系统异常 — 过温/过流/欠压等系统级异常",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        try:
+            from bodyctrl_msgs.msg import ExceptionArray
+            self._sub_node.create_subscription(
+                ExceptionArray, "/exception", self._on_exception, _RELIABLE_QOS)
+            print("[ExceptionPlugin] subscription created")
+        except ImportError as e:
+            print(f"[ExceptionPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    def _on_exception(self, msg):
+        if not self._running:
+            return
+        try:
+            exceptions = []
+            exc_list = getattr(msg, "exception", [])
+            for e in exc_list:
+                exceptions.append({
+                    "motor_id": getattr(e, "motor_id", 0),
+                    "error_code": getattr(e, "error_code", 0),
+                })
+            out = String()
+            out.data = json.dumps({"exceptions": exceptions})
+            self._pub.publish(out)
+        except Exception as e:
+            print(f"[ExceptionPlugin] publish error: {e}", flush=True)
+
+    def dispatch(self, action: str, args: dict) -> dict:
         return {"state": "running"}
 
 

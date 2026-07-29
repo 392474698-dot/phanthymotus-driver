@@ -821,7 +821,7 @@ class ChassisRawPlugin:
         return {
             "name": "chassis_raw",
             "type": "actuator",
-            "description": "天轶2.0 底盘矢量速度 — 任意方向+旋转 (底层 /cmd_vel, 10Hz持续)",
+            "description": "天轶2.0 底盘矢量速度 — 任意方向+旋转 (底层 /cmd_vel, 10Hz, 自动超时停)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -831,11 +831,12 @@ class ChassisRawPlugin:
                     "vx": {"type": "number", "description": "前后速度(m/s), 正=前进"},
                     "vy": {"type": "number", "description": "左右速度(m/s), 正=左移"},
                     "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=逆时针"},
+                    "duration": {"type": "number", "description": "持续时间(秒), move时有效, 到时间自动停止; 默认3秒"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["vx", "vy", "vyaw"], "description": "持续移动"},
-                    "stop": {"params": [], "description": "停止移动"},
+                    "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "移动(duration秒后自动停止)"},
+                    "stop": {"params": [], "description": "立即停止移动"},
                 },
             },
         }
@@ -849,26 +850,61 @@ class ChassisRawPlugin:
             print(f"[ChassisRawPlugin] WARNING: msg import failed ({e})")
 
     def stop(self):
+        self._cancel_auto_stop()
         self._stop_publish()
+        if self._vel_pub:
+            try:
+                from geometry_msgs.msg import Twist
+                self._vel_pub.publish(Twist())
+            except Exception:
+                pass
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move":
-            return self._start_move(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+            vx = args.get("vx", 0.0)
+            vy = args.get("vy", 0.0)
+            vyaw = args.get("vyaw", 0.0)
+            duration = args.get("duration", 3.0)
+            return self._start_move(vx, vy, vyaw, duration)
         elif action == "stop":
-            return self._start_move(0.0, 0.0, 0.0)
+            return self._do_stop()
         elif action in ("start", "info"):
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
-    def _start_move(self, vx: float, vy: float, vyaw: float) -> dict:
+    def _start_move(self, vx: float, vy: float, vyaw: float, duration: float = 3.0) -> dict:
         if not self._vel_pub:
             return {"error": "publisher not initialized"}
+        # Cancel previous auto-stop timer
+        self._cancel_auto_stop()
         self._vx, self._vy, self._vyaw = vx, vy, vyaw
         self._running = True
         if not hasattr(self, '_pub_thread') or not (self._pub_thread and self._pub_thread.is_alive()):
             self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
             self._pub_thread.start()
-        return {"vx": vx, "vy": vy, "vyaw": vyaw}
+        # Schedule auto-stop if duration is positive
+        if duration > 0:
+            self._auto_stop_timer = threading.Timer(duration, self._do_stop)
+            self._auto_stop_timer.daemon = True
+            self._auto_stop_timer.start()
+        return {"vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration, "auto_stop": duration > 0}
+
+    def _cancel_auto_stop(self):
+        timer = getattr(self, '_auto_stop_timer', None)
+        if timer and timer.is_alive():
+            timer.cancel()
+
+    def _do_stop(self) -> dict:
+        """Stop movement — publish zero velocity and stop publish loop."""
+        self._running = False
+        self._cancel_auto_stop()
+        if self._vel_pub:
+            try:
+                from geometry_msgs.msg import Twist
+                self._vel_pub.publish(Twist())  # zero velocity
+            except Exception:
+                pass
+        return {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "state": "stopped"}
 
     def _stop_publish(self):
         self._running = False

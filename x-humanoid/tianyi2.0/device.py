@@ -669,9 +669,10 @@ class MotorAlarmPlugin:
             alarm_list = getattr(msg, "alarm", [])
             for a in alarm_list:
                 alarms.append({
-                    "motor_id": getattr(a, "motor_id", 0),
+                    "node_name": getattr(a, "node_name", ""),
                     "error_code": getattr(a, "error_code", 0),
-                    "error_msg": getattr(a, "error_msg", ""),
+                    "level": getattr(a, "level", 0),
+                    "description": getattr(a, "description", ""),
                 })
             out = String()
             out.data = json.dumps({"alarms": alarms})
@@ -730,11 +731,12 @@ class ExceptionPlugin:
             return
         try:
             exceptions = []
-            exc_list = getattr(msg, "exception", [])
+            exc_list = getattr(msg, "alarm", [])
             for e in exc_list:
                 exceptions.append({
-                    "motor_id": getattr(e, "motor_id", 0),
-                    "error_code": getattr(e, "error_code", 0),
+                    "code": getattr(e, "code", 0),
+                    "desc": getattr(e, "desc", ""),
+                    "nodename": getattr(e, "nodename", ""),
                 })
             out = String()
             out.data = json.dumps({"exceptions": exceptions})
@@ -818,6 +820,10 @@ class ChassisRawPlugin:
         self._vx = 0.0
         self._vy = 0.0
         self._vyaw = 0.0
+        self._max_vx = float(plugin_config.get("max_vx", 0.5))
+        self._max_vy = float(plugin_config.get("max_vy", 0.5))
+        self._max_vyaw = float(plugin_config.get("max_vyaw", 1.0))
+        self._max_duration = float(plugin_config.get("max_duration", 5.0))
 
     def get_tool(self) -> dict:
         return {
@@ -863,10 +869,13 @@ class ChassisRawPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move":
-            vx = args.get("vx", 0.0)
-            vy = args.get("vy", 0.0)
-            vyaw = args.get("vyaw", 0.0)
-            duration = args.get("duration", 3.0)
+            try:
+                vx = self._clamp(float(args.get("vx", 0.0)), -self._max_vx, self._max_vx)
+                vy = self._clamp(float(args.get("vy", 0.0)), -self._max_vy, self._max_vy)
+                vyaw = self._clamp(float(args.get("vyaw", 0.0)), -self._max_vyaw, self._max_vyaw)
+                duration = self._clamp(float(args.get("duration", 3.0)), 0.0, self._max_duration)
+            except (TypeError, ValueError):
+                return {"error": "vx, vy, vyaw and duration must be numbers"}
             return self._start_move(vx, vy, vyaw, duration)
         elif action == "stop":
             return self._do_stop()
@@ -890,6 +899,10 @@ class ChassisRawPlugin:
             self._auto_stop_timer.daemon = True
             self._auto_stop_timer.start()
         return {"vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration, "auto_stop": duration > 0}
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
 
     def _cancel_auto_stop(self):
         timer = getattr(self, '_auto_stop_timer', None)
@@ -1298,6 +1311,7 @@ class BodyHeightPlugin:
         self._leg_pub = None
         self._pub_node = Node("tianyi2_height_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
+        self._height_mm = 1450
 
     def get_tool(self) -> dict:
         return {
@@ -1338,15 +1352,17 @@ class BodyHeightPlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "set":
-            height = max(1280, min(1630, args.get("height", 1450)))
-            return self._set_height(height)
-        elif action == "rise":
-            step = args.get("step", 50)
-            return self._set_height(1600)  # simplified: just go to upper range
-        elif action == "lower":
-            step = args.get("step", 50)
-            return self._set_height(1300)  # simplified: just go to lower range
+        if action in ("set", "rise", "lower"):
+            try:
+                if action == "set":
+                    height = float(args.get("height", 1450))
+                    return self._set_height(height)
+                step = float(args.get("step", 50))
+            except (TypeError, ValueError):
+                return {"error": "height and step must be numbers"}
+            if action == "rise":
+                return self._set_height(self._height_mm + step)
+            return self._set_height(self._height_mm - step)
         elif action == "reset":
             return self._set_height(1450)
         elif action in ("start", "info"):
@@ -1359,6 +1375,7 @@ class BodyHeightPlugin:
         if not self._leg_pub:
             return {"error": "publisher not initialized"}
         try:
+            height_mm = max(1280, min(1630, float(height_mm)))
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             # Approximate mapping: 1280mm → hip_60° knee_80°, 1630mm → hip_0° knee_0°
             ratio = (height_mm - 1280) / (1630 - 1280)
@@ -1375,6 +1392,7 @@ class BodyHeightPlugin:
                 cmds.append(cmd)
             msg.cmds = cmds
             self._leg_pub.publish(msg)
+            self._height_mm = height_mm
             return {"height_mm": height_mm, "hip_deg": hip_deg, "knee_deg": knee_deg}
         except Exception as e:
             return {"error": str(e)}

@@ -152,11 +152,6 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
-        if plugins_cfg.get("imu", {}).get("enabled", False):
-            from device import ImuPlugin
-            self._plugins.append(ImuPlugin(plugins_cfg["imu"], namespace, ros2))
-            print("[bundle] ImuPlugin loaded")
-
         if plugins_cfg.get("motor_alarm", {}).get("enabled", False):
             from device import MotorAlarmPlugin
             self._plugins.append(MotorAlarmPlugin(plugins_cfg["motor_alarm"], namespace, ros2))

@@ -25,7 +25,6 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
-  ImuPlugin        (sensor)             — 姿态传感器 (加速度+角速度)
   MotorAlarmPlugin (sensor)             — 电机异常报警
   ExceptionPlugin  (sensor)             — 系统异常
   ChassisSafetyPlugin (sensor)          — 底盘安全检测
@@ -612,70 +611,6 @@ class NavStatePlugin:
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
-        return {"state": "running"}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ImuPlugin (sensor)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ImuPlugin:
-    """姿态传感器 — 三轴加速度 + 三轴角速度，摔倒/碰撞检测"""
-
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
-        self._ns = namespace
-        self._ros2 = ros2
-        self._topic = f"/{namespace}/state/imu"
-        self._running = False
-
-        self._sub_node = Node("tianyi2_imu_sub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._sub_node)
-
-        self._pub_node = Node("tianyi2_imu_pub", context=ros2.ctx_core)
-        ros2.executor_core.add_node(self._pub_node)
-        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
-
-    def get_tool(self) -> dict:
-        return {
-            "name": "imu",
-            "type": "sensor",
-            "description": "天轶2.0 姿态传感器 — 加速度/角速度 (摔倒/碰撞检测)",
-            "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._topic, "format": "data/json"}],
-        }
-
-    def start(self):
-        self._running = True
-        try:
-            from bodyctrl_msgs.msg import Imu as ImuMsg
-            self._sub_node.create_subscription(
-                ImuMsg, "/imu", self._on_imu, _LOW_LAT_QOS)
-            print("[ImuPlugin] subscription created")
-        except ImportError as e:
-            print(f"[ImuPlugin] WARNING: msg import failed ({e})")
-
-    def stop(self):
-        self._running = False
-
-    def _on_imu(self, msg):
-        if not self._running:
-            return
-        try:
-            data = {
-                "accel_x": getattr(msg, "accel_x", 0.0),
-                "accel_y": getattr(msg, "accel_y", 0.0),
-                "accel_z": getattr(msg, "accel_z", 0.0),
-                "gyro_x": getattr(msg, "gyro_x", 0.0),
-                "gyro_y": getattr(msg, "gyro_y", 0.0),
-                "gyro_z": getattr(msg, "gyro_z", 0.0),
-            }
-            out = String()
-            out.data = json.dumps(data)
-            self._pub.publish(out)
-        except Exception as e:
-            print(f"[ImuPlugin] publish error: {e}", flush=True)
-
-    def dispatch(self, action: str, args: dict) -> dict:
         return {"state": "running"}
 
 

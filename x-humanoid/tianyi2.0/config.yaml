@@ -28,8 +28,6 @@ plugins:
     enabled: true
   chat:
     enabled: true
-  imu:
-    enabled: true
   motor_alarm:
     enabled: true
   exception:

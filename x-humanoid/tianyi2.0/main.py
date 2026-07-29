@@ -172,10 +172,20 @@ class TianyiDeviceBundle:
             self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2))
             print("[bundle] ChassisRawPlugin loaded")
 
-        if plugins_cfg.get("gesture", {}).get("enabled", False):
-            from device import GesturePlugin
-            self._plugins.append(GesturePlugin(plugins_cfg["gesture"], namespace, ros2))
-            print("[bundle] GesturePlugin loaded")
+        if plugins_cfg.get("pack", {}).get("enabled", False):
+            from device import PackPlugin
+            self._plugins.append(PackPlugin(plugins_cfg["pack"], namespace, ros2))
+            print("[bundle] PackPlugin loaded")
+
+        if plugins_cfg.get("photo_pose", {}).get("enabled", False):
+            from device import PhotoPosePlugin
+            self._plugins.append(PhotoPosePlugin(plugins_cfg["photo_pose"], namespace, ros2))
+            print("[bundle] PhotoPosePlugin loaded")
+
+        if plugins_cfg.get("self_check", {}).get("enabled", False):
+            from device import SelfCheckPlugin
+            self._plugins.append(SelfCheckPlugin(plugins_cfg["self_check"], namespace, ros2))
+            print("[bundle] SelfCheckPlugin loaded")
 
         if plugins_cfg.get("body_height", {}).get("enabled", False):
             from device import BodyHeightPlugin

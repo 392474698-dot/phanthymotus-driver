@@ -36,7 +36,11 @@ plugins:
     enabled: true
   chassis_raw:
     enabled: true
-  gesture:
+  pack:
+    enabled: true
+  photo_pose:
+    enabled: true
+  self_check:
     enabled: true
   body_height:
     enabled: true

@@ -29,7 +29,9 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   ExceptionPlugin  (sensor)             — 系统异常
   ChassisSafetyPlugin (sensor)          — 底盘安全检测
   ChassisRawPlugin (actuator)           — 底盘矢量速度控制
-  GesturePlugin    (actuator)           — 预设动作 (挥手/握手/舞蹈)
+  PackPlugin      (actuator)           — 一键装箱/收纳姿态
+  PhotoPosePlugin (actuator)           — 合影姿势
+  SelfCheckPlugin (actuator)           — 启动自检
   BodyHeightPlugin (actuator)           — 身体高度控制
 """
 
@@ -929,65 +931,38 @@ class ChassisRawPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GesturePlugin (actuator)
+# PackPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class GesturePlugin:
-    """预设动作 — 挥手/握手/舞蹈/装箱"""
+class PackPlugin:
+    """一键装箱 — 全身关节移动到收纳/运输姿态 (遥控器 F下拨+D)"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
+        self._pub_node = Node("tianyi2_pack_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
         self._arm_pub = None
         self._waist_pub = None
-        self._pub_node = Node("tianyi2_gesture_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._gesture_thread = None
-        self._running = False
-
-        self._presets = {
-            "wave": [
-                {"arm": "right", "positions": [0, 20, 0, -90, 0, 0, 90], "delay": 0.5},
-                {"arm": "right", "positions": [0, 20, 30, -90, 0, 0, 90], "delay": 0.5},
-                {"arm": "right", "positions": [0, 20, -30, -90, 0, 0, 90], "delay": 0.5},
-                {"arm": "right", "positions": [0, 20, 30, -90, 0, 0, 90], "delay": 0.5},
-                {"arm": "right", "positions": [0, 20, -30, -90, 0, 0, 90], "delay": 0.5},
-            ],
-            "handshake": [
-                {"arm": "right", "positions": [45, 10, 0, -30, 0, 0, 90], "delay": 2.0},
-            ],
-            "dance": [
-                {"waist_yaw": 30, "delay": 0.8},
-                {"waist_yaw": -30, "delay": 0.8},
-                {"waist_yaw": 30, "delay": 0.8},
-                {"waist_yaw": 0, "delay": 0.5},
-            ],
-            "boxing": [
-                {"arm": "right", "positions": [-60, 30, 0, -90, 0, 0, 90], "delay": 0.3},
-                {"arm": "left", "positions": [-60, 30, 0, -90, 0, 0, 90], "delay": 0.3},
-                {"arm": "right", "positions": [-90, 30, 0, -45, 0, 0, 90], "delay": 1.0},
-            ],
-        }
+        self._head_pub = None
+        self._leg_pub = None
 
     def get_tool(self) -> dict:
         return {
-            "name": "gesture",
+            "name": "pack",
             "type": "actuator",
-            "description": "天轶2.0 预设动作 — 挥手/握手/舞蹈/装箱",
+            "description": "天轶2.0 一键装箱 — 全身关节移动到收纳/运输姿态 (对应遥控器 F下拨+D)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["wave", "handshake", "dance", "boxing", "stop"],
-                               "description": "预设动作"},
+                               "enum": ["pack", "reset"],
+                               "description": "控制动作"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "wave": {"params": [], "description": "挥手"},
-                    "handshake": {"params": [], "description": "握手"},
-                    "dance": {"params": [], "description": "简单舞蹈"},
-                    "boxing": {"params": [], "description": "拳击姿势"},
-                    "stop": {"params": [], "description": "停止当前动作"},
+                    "pack": {"params": [], "description": "进入装箱收纳姿态"},
+                    "reset": {"params": [], "description": "恢复到默认站立姿态"},
                 },
             },
         }
@@ -999,87 +974,315 @@ class GesturePlugin:
                 CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
             self._waist_pub = self._pub_node.create_publisher(
                 CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
-            print("[GesturePlugin] publishers created")
+            self._head_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
+            self._leg_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[PackPlugin] publishers created")
         except ImportError as e:
-            print(f"[GesturePlugin] WARNING: msg import failed ({e})")
+            print(f"[PackPlugin] WARNING: msg import failed ({e})")
 
     def stop(self):
-        self._running = False
+        pass
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action in ("wave", "handshake", "dance", "boxing"):
-            sequence = self._presets.get(action, [])
-            if not sequence:
-                return {"error": f"unknown gesture: {action}"}
-            self._running = True
-            self._gesture_thread = threading.Thread(
-                target=self._run_sequence, args=(sequence,), daemon=True)
-            self._gesture_thread.start()
-            return {"gesture": action, "state": "started"}
-        elif action == "stop":
-            self._running = False
-            return {"state": "stopped"}
+        if action == "pack":
+            return self._do_pack()
+        elif action == "reset":
+            return self._do_reset()
         elif action in ("start", "info"):
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
-    def _run_sequence(self, sequence: list):
-        for step in sequence:
-            if not self._running:
-                break
-            try:
-                if "waist_yaw" in step:
-                    self._send_waist_pos(step["waist_yaw"], 0)
-                elif "arm" in step:
-                    self._send_arm_pos(step["arm"], step["positions"])
-                time.sleep(step.get("delay", 0.5))
-            except Exception as e:
-                print(f"[GesturePlugin] step error: {e}", flush=True)
-        self._running = False
-
-    def _send_arm_pos(self, side: str, positions: list):
-        if not self._arm_pub:
-            return
+    def _do_pack(self) -> dict:
+        if not all([self._arm_pub, self._waist_pub, self._head_pub, self._leg_pub]):
+            return {"error": "publishers not initialized"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
-            motor_map = {
-                "left": [11, 12, 13, 14, 15, 16, 17],
-                "right": [21, 22, 23, 24, 25, 26, 27],
-            }
-            ids = motor_map.get(side, [])
-            msg = CmdSetMotorPosition()
-            cmds = []
-            for i, deg in enumerate(positions):
-                if i < len(ids):
-                    cmd = SetMotorPosition()
-                    cmd.name = ids[i]
-                    cmd.pos = _deg2rad(deg)
-                    cmd.spd = 1.5
-                    cmd.cur = 5.0
-                    cmds.append(cmd)
-            msg.cmds = cmds
-            self._arm_pub.publish(msg)
-        except Exception as e:
-            print(f"[GesturePlugin] arm error: {e}", flush=True)
 
-    def _send_waist_pos(self, yaw_deg: float, pitch_deg: float):
-        if not self._waist_pub:
-            return
+            # Head → center: [41=yaw, 42=pitch1, 43=pitch2]
+            head_msg = CmdSetMotorPosition()
+            for mid, deg in [(41, 0), (42, 0), (43, 0)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 1.0; cmd.cur = 2.0; head_msg.cmds.append(cmd)
+            self._head_pub.publish(head_msg)
+
+            # Arms → folded down close to body
+            arm_msg = CmdSetMotorPosition()
+            pack_deg = [0, -30, 0, -90, 0, 0, 0]
+            for side_ids in ([11,12,13,14,15,16,17], [21,22,23,24,25,26,27]):
+                for i, mid in enumerate(side_ids):
+                    cmd = SetMotorPosition(); cmd.name = mid
+                    cmd.pos = _deg2rad(pack_deg[i])
+                    cmd.spd = 1.0; cmd.cur = 3.0; arm_msg.cmds.append(cmd)
+            self._arm_pub.publish(arm_msg)
+
+            # Waist → center
+            waist_msg = CmdSetMotorPosition()
+            for mid, deg in [(31, 0), (32, 0)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; waist_msg.cmds.append(cmd)
+            self._waist_pub.publish(waist_msg)
+
+            # Legs → compact (hip 60°, knee 80° → ~1280mm)
+            leg_msg = CmdSetMotorPosition()
+            for mid, deg in [(51, 60), (52, 80)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; leg_msg.cmds.append(cmd)
+            self._leg_pub.publish(leg_msg)
+
+            return {"state": "packed", "message": "全身关节已移动到装箱姿态"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _do_reset(self) -> dict:
+        if not all([self._arm_pub, self._waist_pub, self._head_pub, self._leg_pub]):
+            return {"error": "publishers not initialized"}
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
-            msg = CmdSetMotorPosition()
-            cmds = []
-            for motor_id, deg in [(31, yaw_deg), (32, pitch_deg)]:
-                cmd = SetMotorPosition()
-                cmd.name = motor_id
-                cmd.pos = _deg2rad(deg)
-                cmd.spd = 0.5
-                cmd.cur = 10.0
-                cmds.append(cmd)
-            msg.cmds = cmds
-            self._waist_pub.publish(msg)
+
+            # Head → center
+            head_msg = CmdSetMotorPosition()
+            for mid in (41, 42, 43):
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = 0.0
+                cmd.spd = 1.0; cmd.cur = 2.0; head_msg.cmds.append(cmd)
+            self._head_pub.publish(head_msg)
+
+            # Arms → neutral
+            arm_msg = CmdSetMotorPosition()
+            for side_ids in ([11,12,13,14,15,16,17], [21,22,23,24,25,26,27]):
+                for mid in side_ids:
+                    cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = 0.0
+                    cmd.spd = 1.0; cmd.cur = 3.0; arm_msg.cmds.append(cmd)
+            self._arm_pub.publish(arm_msg)
+
+            # Waist → center
+            waist_msg = CmdSetMotorPosition()
+            for mid, deg in [(31, 0), (32, 0)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; waist_msg.cmds.append(cmd)
+            self._waist_pub.publish(waist_msg)
+
+            # Legs → default (~1450mm)
+            ratio = (1450 - 1280) / (1630 - 1280)
+            leg_msg = CmdSetMotorPosition()
+            for mid, deg in [(51, 60.0*(1-ratio)), (52, 80.0*(1-ratio))]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; leg_msg.cmds.append(cmd)
+            self._leg_pub.publish(leg_msg)
+
+            return {"state": "reset", "message": "已恢复到默认站立姿态"}
         except Exception as e:
-            print(f"[GesturePlugin] waist error: {e}", flush=True)
+            return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PhotoPosePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PhotoPosePlugin:
+    """合影姿势 — 摆出适合合影的姿势 (遥控器 BBB+A)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_photo_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._arm_pub = None
+        self._waist_pub = None
+        self._head_pub = None
+        self._leg_pub = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "photo_pose",
+            "type": "actuator",
+            "description": "天轶2.0 合影姿势 — 摆出适合合影的展示姿态 (对应遥控器 BBB+A)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["photo", "reset"],
+                               "description": "控制动作"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "photo": {"params": [], "description": "摆出合影姿势"},
+                    "reset": {"params": [], "description": "恢复到默认站立姿态"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._arm_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
+            self._waist_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
+            self._head_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/head/cmd_pos", _RELIABLE_QOS)
+            self._leg_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[PhotoPosePlugin] publishers created")
+        except ImportError as e:
+            print(f"[PhotoPosePlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "photo":
+            return self._do_photo()
+        elif action == "reset":
+            return self._do_reset()
+        elif action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _do_photo(self) -> dict:
+        if not all([self._arm_pub, self._waist_pub, self._head_pub, self._leg_pub]):
+            return {"error": "publishers not initialized"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+
+            # Head → centered
+            head_msg = CmdSetMotorPosition()
+            for mid, deg in [(41, 0), (42, 0), (43, 0)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 1.0; cmd.cur = 2.0; head_msg.cmds.append(cmd)
+            self._head_pub.publish(head_msg)
+
+            # Arms → open welcoming pose
+            # Left arm slightly out, right arm waving-ready
+            arm_msg = CmdSetMotorPosition()
+            left_deg  = [30, 10, 0, -60, 0, 0, 70]   # left arm open
+            right_deg = [-30, 20, 0, -45, 0, 0, 80]   # right arm slightly raised
+            for mid, deg in zip([11,12,13,14,15,16,17], left_deg):
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 1.0; cmd.cur = 3.0; arm_msg.cmds.append(cmd)
+            for mid, deg in zip([21,22,23,24,25,26,27], right_deg):
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 1.0; cmd.cur = 3.0; arm_msg.cmds.append(cmd)
+            self._arm_pub.publish(arm_msg)
+
+            # Waist → center
+            waist_msg = CmdSetMotorPosition()
+            for mid, deg in [(31, 0), (32, 0)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; waist_msg.cmds.append(cmd)
+            self._waist_pub.publish(waist_msg)
+
+            # Legs → tall (1600mm)
+            ratio = (1600 - 1280) / (1630 - 1280)
+            leg_msg = CmdSetMotorPosition()
+            for mid, deg in [(51, 60.0*(1-ratio)), (52, 80.0*(1-ratio))]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; leg_msg.cmds.append(cmd)
+            self._leg_pub.publish(leg_msg)
+
+            return {"state": "photo_pose", "message": "已摆出合影姿势"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _do_reset(self) -> dict:
+        if not all([self._arm_pub, self._waist_pub, self._head_pub, self._leg_pub]):
+            return {"error": "publishers not initialized"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            head_msg = CmdSetMotorPosition()
+            for mid in (41, 42, 43):
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = 0.0
+                cmd.spd = 1.0; cmd.cur = 2.0; head_msg.cmds.append(cmd)
+            self._head_pub.publish(head_msg)
+
+            arm_msg = CmdSetMotorPosition()
+            for side_ids in ([11,12,13,14,15,16,17], [21,22,23,24,25,26,27]):
+                for mid in side_ids:
+                    cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = 0.0
+                    cmd.spd = 1.0; cmd.cur = 3.0; arm_msg.cmds.append(cmd)
+            self._arm_pub.publish(arm_msg)
+
+            waist_msg = CmdSetMotorPosition()
+            for mid, deg in [(31, 0), (32, 0)]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; waist_msg.cmds.append(cmd)
+            self._waist_pub.publish(waist_msg)
+
+            ratio = (1450 - 1280) / (1630 - 1280)
+            leg_msg = CmdSetMotorPosition()
+            for mid, deg in [(51, 60.0*(1-ratio)), (52, 80.0*(1-ratio))]:
+                cmd = SetMotorPosition(); cmd.name = mid; cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5; cmd.cur = 5.0; leg_msg.cmds.append(cmd)
+            self._leg_pub.publish(leg_msg)
+
+            return {"state": "reset", "message": "已恢复到默认站立姿态"}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SelfCheckPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SelfCheckPlugin:
+    """启动自检 — 触发机器人开机自检流程 (遥控器 A 键)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._pub_node = Node("tianyi2_selfcheck_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._publisher = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "self_check",
+            "type": "actuator",
+            "description": "天轶2.0 启动自检 — 触发全身关节/传感器自检流程 (对应遥控器 A 键)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["start"],
+                               "description": "触发自检"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "start": {"params": [], "description": "启动自检流程"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from std_msgs.msg import Bool
+            self._publisher = self._pub_node.create_publisher(
+                Bool, "/cmd/self_check", _RELIABLE_QOS)
+            print("[SelfCheckPlugin] publisher created")
+        except ImportError as e:
+            print(f"[SelfCheckPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "start":
+            return self._trigger()
+        elif action in ("info",):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _trigger(self) -> dict:
+        if not self._publisher:
+            return {"error": "publisher not initialized"}
+        try:
+            from std_msgs.msg import Bool
+            msg = Bool(); msg.data = True
+            self._publisher.publish(msg)
+            return {"state": "self_check_triggered", "message": "自检流程已触发，请观察整机状态灯"}
+        except Exception as e:
+            return {"error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

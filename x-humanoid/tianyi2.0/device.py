@@ -645,9 +645,9 @@ class PowerThermalPlugin:
     def start(self):
         self._running = True
         try:
-            from bodyctrl_msgs.msg import PowerBoardStatus
+            from bodyctrl_msgs.msg import PowerStatus
             self._sub_node.create_subscription(
-                PowerBoardStatus, "/power/board/status", self._on_power_status, _RELIABLE_QOS)
+                PowerStatus, "/power/board/status", self._on_power_status, _RELIABLE_QOS)
             print("[PowerThermalPlugin] subscription created")
         except ImportError as e:
             print(f"[PowerThermalPlugin] WARNING: msg import failed ({e})")

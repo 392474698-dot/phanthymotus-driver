@@ -289,7 +289,7 @@ def make_handler():
                     ok({
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "tianyi2-device-bundle", "version": "1.0.0"},
+                        "serverInfo": {"name": "tianyi2-device-bundle-sdl", "version": "1.0.0"},
                     })
                 elif method == "tools/list":
                     ok({"tools": _bundle.get_all_tools()})

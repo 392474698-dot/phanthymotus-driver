@@ -216,7 +216,7 @@ class TianyiDeviceBundle:
                 if tool_def["name"] == tool_name:
                     if tool_def["type"] == "resource":
                         return p.dispatch(tool_name, args)
-                    action = args.pop("action", tool_name)
+                    action = args.pop("action", "start")
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
                     return result

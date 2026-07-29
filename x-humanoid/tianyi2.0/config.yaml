@@ -34,3 +34,9 @@ plugins:
     enabled: true
   chassis_safety:
     enabled: true
+  chassis_raw:
+    enabled: true
+  gesture:
+    enabled: true
+  body_height:
+    enabled: true

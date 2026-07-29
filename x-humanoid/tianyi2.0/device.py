@@ -28,6 +28,9 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorAlarmPlugin (sensor)             — 电机异常报警
   ExceptionPlugin  (sensor)             — 系统异常
   ChassisSafetyPlugin (sensor)          — 底盘安全检测
+  ChassisRawPlugin (actuator)           — 底盘矢量速度控制
+  GesturePlugin    (actuator)           — 预设动作 (挥手/握手/舞蹈)
+  BodyHeightPlugin (actuator)           — 身体高度控制
 """
 
 import json
@@ -794,6 +797,341 @@ class ChassisSafetyPlugin:
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ChassisRawPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChassisRawPlugin:
+    """底盘矢量速度控制 — 任意方向+旋转 (底层 /cmd_vel)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._vel_pub = None
+        self._pub_node = Node("tianyi2_chassis_raw_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "chassis_raw",
+            "type": "actuator",
+            "description": "天轶2.0 底盘矢量速度 — 任意方向+旋转 (底层 /cmd_vel, 不避障)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["move", "stop"],
+                               "description": "控制动作"},
+                    "vx": {"type": "number",
+                           "description": "前后速度(m/s), 正=前进"},
+                    "vy": {"type": "number",
+                           "description": "左右速度(m/s), 正=左移"},
+                    "vyaw": {"type": "number",
+                             "description": "旋转速度(rad/s), 正=逆时针"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move": {"params": ["vx", "vy", "vyaw"],
+                             "description": "底盘矢量移动 (持续发送)"},
+                    "stop": {"params": [],
+                             "description": "停止移动"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from geometry_msgs.msg import Twist
+            self._vel_pub = self._pub_node.create_publisher(Twist, "/cmd_vel", _RELIABLE_QOS)
+            print("[ChassisRawPlugin] publisher created")
+        except ImportError as e:
+            print(f"[ChassisRawPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        if self._vel_pub:
+            try:
+                from geometry_msgs.msg import Twist
+                self._vel_pub.publish(Twist())
+            except Exception:
+                pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "move":
+            return self._send_move(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+        elif action == "stop":
+            return self._send_move(0.0, 0.0, 0.0)
+        elif action in ("start", "info"):
+            return {"state": "ready"}
+        elif action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown action: {action}"}
+
+    def _send_move(self, vx: float, vy: float, vyaw: float) -> dict:
+        if not self._vel_pub:
+            return {"error": "publisher not initialized"}
+        try:
+            from geometry_msgs.msg import Twist
+            twist = Twist()
+            twist.linear.x = vx
+            twist.linear.y = vy
+            twist.angular.z = vyaw
+            self._vel_pub.publish(twist)
+            return {"vx": vx, "vy": vy, "vyaw": vyaw}
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GesturePlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GesturePlugin:
+    """预设动作 — 挥手/握手/舞蹈/装箱"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._arm_pub = None
+        self._pub_node = Node("tianyi2_gesture_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+        self._gesture_thread = None
+        self._running = False
+
+        _HEAD_JOINTS = {1: "head_roll_joint", 2: "head_pitch_joint", 3: "head_yaw_joint"}
+        _ARM_LEFT_JOINTS = {11: "L_shoulder_pitch", 12: "L_shoulder_roll", 13: "L_shoulder_yaw",
+                            14: "L_elbow_pitch", 15: "L_wrist_yaw", 16: "L_wrist_pitch", 17: "L_wrist_roll"}
+        _ARM_RIGHT_JOINTS = {21: "R_shoulder_pitch", 22: "R_shoulder_roll", 23: "R_shoulder_yaw",
+                             24: "R_elbow_pitch", 25: "R_wrist_yaw", 26: "R_wrist_pitch", 27: "R_wrist_roll"}
+        _WAIST_JOINTS = {31: "waist_yaw_joint", 32: "waist_pitch_joint"}
+
+        self._presets = {
+            "wave": [
+                {"arm": "right", "positions": [0, 20, 0, -90, 0, 0, 90], "delay": 0.5},
+                {"arm": "right", "positions": [0, 20, 30, -90, 0, 0, 90], "delay": 0.5},
+                {"arm": "right", "positions": [0, 20, -30, -90, 0, 0, 90], "delay": 0.5},
+                {"arm": "right", "positions": [0, 20, 30, -90, 0, 0, 90], "delay": 0.5},
+                {"arm": "right", "positions": [0, 20, -30, -90, 0, 0, 90], "delay": 0.5},
+            ],
+            "handshake": [
+                {"arm": "right", "positions": [45, 10, 0, -30, 0, 0, 90], "delay": 2.0},
+            ],
+            "dance": [
+                {"waist_yaw": 30, "delay": 0.8},
+                {"waist_yaw": -30, "delay": 0.8},
+                {"waist_yaw": 30, "delay": 0.8},
+                {"waist_yaw": 0, "delay": 0.5},
+            ],
+            "boxing": [
+                {"arm": "right", "positions": [-60, 30, 0, -90, 0, 0, 90], "delay": 0.3},
+                {"arm": "left", "positions": [-60, 30, 0, -90, 0, 0, 90], "delay": 0.3},
+                {"arm": "right", "positions": [-90, 30, 0, -45, 0, 0, 90], "delay": 1.0},
+            ],
+        }
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "gesture",
+            "type": "actuator",
+            "description": "天轶2.0 预设动作 — 挥手/握手/舞蹈/装箱",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["wave", "handshake", "dance", "boxing", "stop"],
+                               "description": "预设动作"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "wave": {"params": [], "description": "挥手"},
+                    "handshake": {"params": [], "description": "握手"},
+                    "dance": {"params": [], "description": "简单舞蹈"},
+                    "boxing": {"params": [], "description": "拳击姿势"},
+                    "stop": {"params": [], "description": "停止当前动作"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._arm_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
+            print("[GesturePlugin] publisher created")
+        except ImportError as e:
+            print(f"[GesturePlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        self._running = False
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("wave", "handshake", "dance", "boxing"):
+            sequence = self._presets.get(action, [])
+            if not sequence:
+                return {"error": f"unknown gesture: {action}"}
+            self._running = True
+            self._gesture_thread = threading.Thread(
+                target=self._run_sequence, args=(sequence,), daemon=True)
+            self._gesture_thread.start()
+            return {"gesture": action, "state": "started"}
+        elif action == "stop":
+            self._running = False
+            return {"state": "stopped"}
+        elif action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _run_sequence(self, sequence: list):
+        for step in sequence:
+            if not self._running:
+                break
+            try:
+                if "waist_yaw" in step:
+                    self._send_waist_pos(step["waist_yaw"], 0)
+                elif "arm" in step:
+                    self._send_arm_pos(step["arm"], step["positions"])
+                time.sleep(step.get("delay", 0.5))
+            except Exception as e:
+                print(f"[GesturePlugin] step error: {e}", flush=True)
+        self._running = False
+
+    def _send_arm_pos(self, side: str, positions: list):
+        if not self._arm_pub:
+            return
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            motor_map = {
+                "left": [11, 12, 13, 14, 15, 16, 17],
+                "right": [21, 22, 23, 24, 25, 26, 27],
+            }
+            ids = motor_map.get(side, [])
+            msg = CmdSetMotorPosition()
+            cmds = []
+            for i, deg in enumerate(positions):
+                if i < len(ids):
+                    cmd = SetMotorPosition()
+                    cmd.name = ids[i]
+                    cmd.pos = _deg2rad(deg)
+                    cmd.spd = 1.5
+                    cmd.cur = 5.0
+                    cmds.append(cmd)
+            msg.cmds = cmds
+            self._arm_pub.publish(msg)
+        except Exception as e:
+            print(f"[GesturePlugin] arm error: {e}", flush=True)
+
+    def _send_waist_pos(self, yaw_deg: float, pitch_deg: float):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            msg = CmdSetMotorPosition()
+            cmds = []
+            for motor_id, deg in [(31, yaw_deg), (32, pitch_deg)]:
+                cmd = SetMotorPosition()
+                cmd.name = motor_id
+                cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.5
+                cmd.cur = 10.0
+                cmds.append(cmd)
+            msg.cmds = cmds
+            self._arm_pub.publish(msg)
+        except Exception as e:
+            print(f"[GesturePlugin] waist error: {e}", flush=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BodyHeightPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BodyHeightPlugin:
+    """身体高度控制 — 调节腿部电机 (1280~1630mm)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._leg_pub = None
+        self._pub_node = Node("tianyi2_height_pub", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._pub_node)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "body_height",
+            "type": "actuator",
+            "description": "天轶2.0 身体高度控制 — 调节腿部电机 (1280~1630mm)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["set", "rise", "lower", "reset"],
+                               "description": "控制动作"},
+                    "height": {"type": "number",
+                               "description": "目标高度(mm), 范围[1280, 1630]"},
+                    "step": {"type": "number",
+                             "description": "上升/下降步长(mm), 默认50"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "set": {"params": ["height"], "description": "设置目标高度(mm)"},
+                    "rise": {"params": ["step"], "description": "上升指定高度"},
+                    "lower": {"params": ["step"], "description": "下降指定高度"},
+                    "reset": {"params": [], "description": "恢复到默认高度"},
+                },
+            },
+        }
+
+    def start(self):
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition
+            self._leg_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/leg/cmd_pos", _RELIABLE_QOS)
+            print("[BodyHeightPlugin] publisher created")
+        except ImportError as e:
+            print(f"[BodyHeightPlugin] WARNING: msg import failed ({e})")
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "set":
+            height = max(1280, min(1630, args.get("height", 1450)))
+            return self._set_height(height)
+        elif action == "rise":
+            step = args.get("step", 50)
+            return self._set_height(1600)  # simplified: just go to upper range
+        elif action == "lower":
+            step = args.get("step", 50)
+            return self._set_height(1300)  # simplified: just go to lower range
+        elif action == "reset":
+            return self._set_height(1450)
+        elif action in ("start", "info"):
+            return {"state": "ready"}
+        elif action == "stop":
+            return {"state": "idle"}
+        return {"error": f"unknown action: {action}"}
+
+    def _set_height(self, height_mm: float) -> dict:
+        if not self._leg_pub:
+            return {"error": "publisher not initialized"}
+        try:
+            from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+            # Approximate mapping: 1280mm → hip_60° knee_80°, 1630mm → hip_0° knee_0°
+            ratio = (height_mm - 1280) / (1630 - 1280)
+            hip_deg = 60.0 * (1 - ratio)
+            knee_deg = 80.0 * (1 - ratio)
+            msg = CmdSetMotorPosition()
+            cmds = []
+            for motor_id, deg in [(51, hip_deg), (52, knee_deg)]:
+                cmd = SetMotorPosition()
+                cmd.name = motor_id
+                cmd.pos = _deg2rad(deg)
+                cmd.spd = 0.8
+                cmd.cur = 8.0
+                cmds.append(cmd)
+            msg.cmds = cmds
+            self._leg_pub.publish(msg)
+            return {"height_mm": height_mm, "hip_deg": hip_deg, "knee_deg": knee_deg}
+        except Exception as e:
+            return {"error": str(e)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

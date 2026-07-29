@@ -167,6 +167,21 @@ class TianyiDeviceBundle:
             self._plugins.append(ChassisSafetyPlugin(plugins_cfg["chassis_safety"], namespace, ros2, slamtec_client))
             print("[bundle] ChassisSafetyPlugin loaded")
 
+        if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
+            from device import ChassisRawPlugin
+            self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2))
+            print("[bundle] ChassisRawPlugin loaded")
+
+        if plugins_cfg.get("gesture", {}).get("enabled", False):
+            from device import GesturePlugin
+            self._plugins.append(GesturePlugin(plugins_cfg["gesture"], namespace, ros2))
+            print("[bundle] GesturePlugin loaded")
+
+        if plugins_cfg.get("body_height", {}).get("enabled", False):
+            from device import BodyHeightPlugin
+            self._plugins.append(BodyHeightPlugin(plugins_cfg["body_height"], namespace, ros2))
+            print("[bundle] BodyHeightPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

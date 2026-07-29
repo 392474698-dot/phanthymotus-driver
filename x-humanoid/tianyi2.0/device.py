@@ -804,7 +804,7 @@ class ChassisSafetyPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ChassisRawPlugin:
-    """底盘矢量速度控制 — 任意方向+旋转 (底层 /cmd_vel)"""
+    """底盘矢量速度控制 — 任意方向+旋转 (底层 /cmd_vel, 10Hz 持续发布)"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
@@ -812,31 +812,30 @@ class ChassisRawPlugin:
         self._vel_pub = None
         self._pub_node = Node("tianyi2_chassis_raw_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
+        self._running = False
+        self._vx = 0.0
+        self._vy = 0.0
+        self._vyaw = 0.0
 
     def get_tool(self) -> dict:
         return {
             "name": "chassis_raw",
             "type": "actuator",
-            "description": "天轶2.0 底盘矢量速度 — 任意方向+旋转 (底层 /cmd_vel, 不避障)",
+            "description": "天轶2.0 底盘矢量速度 — 任意方向+旋转 (底层 /cmd_vel, 10Hz持续)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
                                "enum": ["move", "stop"],
                                "description": "控制动作"},
-                    "vx": {"type": "number",
-                           "description": "前后速度(m/s), 正=前进"},
-                    "vy": {"type": "number",
-                           "description": "左右速度(m/s), 正=左移"},
-                    "vyaw": {"type": "number",
-                             "description": "旋转速度(rad/s), 正=逆时针"},
+                    "vx": {"type": "number", "description": "前后速度(m/s), 正=前进"},
+                    "vy": {"type": "number", "description": "左右速度(m/s), 正=左移"},
+                    "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=逆时针"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["vx", "vy", "vyaw"],
-                             "description": "底盘矢量移动 (持续发送)"},
-                    "stop": {"params": [],
-                             "description": "停止移动"},
+                    "move": {"params": ["vx", "vy", "vyaw"], "description": "持续移动"},
+                    "stop": {"params": [], "description": "停止移动"},
                 },
             },
         }
@@ -850,37 +849,47 @@ class ChassisRawPlugin:
             print(f"[ChassisRawPlugin] WARNING: msg import failed ({e})")
 
     def stop(self):
-        if self._vel_pub:
-            try:
-                from geometry_msgs.msg import Twist
-                self._vel_pub.publish(Twist())
-            except Exception:
-                pass
+        self._stop_publish()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move":
-            return self._send_move(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
+            return self._start_move(args.get("vx", 0.0), args.get("vy", 0.0), args.get("vyaw", 0.0))
         elif action == "stop":
-            return self._send_move(0.0, 0.0, 0.0)
+            return self._start_move(0.0, 0.0, 0.0)
         elif action in ("start", "info"):
             return {"state": "ready"}
-        elif action == "stop":
-            return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
 
-    def _send_move(self, vx: float, vy: float, vyaw: float) -> dict:
+    def _start_move(self, vx: float, vy: float, vyaw: float) -> dict:
         if not self._vel_pub:
             return {"error": "publisher not initialized"}
+        self._vx, self._vy, self._vyaw = vx, vy, vyaw
+        self._running = True
+        if not hasattr(self, '_pub_thread') or not (self._pub_thread and self._pub_thread.is_alive()):
+            self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
+            self._pub_thread.start()
+        return {"vx": vx, "vy": vy, "vyaw": vyaw}
+
+    def _stop_publish(self):
+        self._running = False
+
+    def _publish_loop(self):
+        from geometry_msgs.msg import Twist
+        while self._running:
+            try:
+                twist = Twist()
+                twist.linear.x = self._vx
+                twist.linear.y = self._vy
+                twist.angular.z = self._vyaw
+                self._vel_pub.publish(twist)
+            except Exception:
+                pass
+            time.sleep(0.1)  # 10Hz
+        # send zero on stop
         try:
-            from geometry_msgs.msg import Twist
-            twist = Twist()
-            twist.linear.x = vx
-            twist.linear.y = vy
-            twist.angular.z = vyaw
-            self._vel_pub.publish(twist)
-            return {"vx": vx, "vy": vy, "vyaw": vyaw}
-        except Exception as e:
-            return {"error": str(e)}
+            self._vel_pub.publish(Twist())
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -894,17 +903,11 @@ class GesturePlugin:
         self._ns = namespace
         self._ros2 = ros2
         self._arm_pub = None
+        self._waist_pub = None
         self._pub_node = Node("tianyi2_gesture_pub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._pub_node)
         self._gesture_thread = None
         self._running = False
-
-        _HEAD_JOINTS = {1: "head_roll_joint", 2: "head_pitch_joint", 3: "head_yaw_joint"}
-        _ARM_LEFT_JOINTS = {11: "L_shoulder_pitch", 12: "L_shoulder_roll", 13: "L_shoulder_yaw",
-                            14: "L_elbow_pitch", 15: "L_wrist_yaw", 16: "L_wrist_pitch", 17: "L_wrist_roll"}
-        _ARM_RIGHT_JOINTS = {21: "R_shoulder_pitch", 22: "R_shoulder_roll", 23: "R_shoulder_yaw",
-                             24: "R_elbow_pitch", 25: "R_wrist_yaw", 26: "R_wrist_pitch", 27: "R_wrist_roll"}
-        _WAIST_JOINTS = {31: "waist_yaw_joint", 32: "waist_pitch_joint"}
 
         self._presets = {
             "wave": [
@@ -958,7 +961,9 @@ class GesturePlugin:
             from bodyctrl_msgs.msg import CmdSetMotorPosition
             self._arm_pub = self._pub_node.create_publisher(
                 CmdSetMotorPosition, "/arm/cmd_pos", _RELIABLE_QOS)
-            print("[GesturePlugin] publisher created")
+            self._waist_pub = self._pub_node.create_publisher(
+                CmdSetMotorPosition, "/waist/cmd_pos", _RELIABLE_QOS)
+            print("[GesturePlugin] publishers created")
         except ImportError as e:
             print(f"[GesturePlugin] WARNING: msg import failed ({e})")
 
@@ -1022,6 +1027,8 @@ class GesturePlugin:
             print(f"[GesturePlugin] arm error: {e}", flush=True)
 
     def _send_waist_pos(self, yaw_deg: float, pitch_deg: float):
+        if not self._waist_pub:
+            return
         try:
             from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
             msg = CmdSetMotorPosition()
@@ -1034,7 +1041,7 @@ class GesturePlugin:
                 cmd.cur = 10.0
                 cmds.append(cmd)
             msg.cmds = cmds
-            self._arm_pub.publish(msg)
+            self._waist_pub.publish(msg)
         except Exception as e:
             print(f"[GesturePlugin] waist error: {e}", flush=True)
 

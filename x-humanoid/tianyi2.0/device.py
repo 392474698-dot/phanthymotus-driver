@@ -704,7 +704,7 @@ class ChassisSafetyPlugin:
         return {
             "name": "chassis_safety",
             "type": "sensor",
-            "description": "天轶2.0 底盘安全检测 — 碰撞/磁感/悬崖状态 (Slamtec底盘)",
+            "description": "天轶2.0 底盘安全检测 — 错误/急停/传感器/充电/电量 (Slamtec底盘)",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }

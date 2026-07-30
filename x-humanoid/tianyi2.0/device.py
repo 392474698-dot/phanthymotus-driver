@@ -25,15 +25,9 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   TtsPlugin        (actuator)           — 语音合成
   NavPlugin        (actuator)           — 底盘导航控制
   ChatPlugin       (actuator)           — 语音交互开关
-  MotorAlarmPlugin (sensor)             — 电机异常报警
-  ExceptionPlugin  (sensor)             — 系统异常
   ChassisSafetyPlugin (sensor)          — 底盘安全检测
   LaserScanPlugin (sensor)              — 激光雷达原始数据
-  ChassisRawPlugin (actuator)           — 底盘矢量速度控制
-  PackPlugin      (actuator)           — 一键装箱/收纳姿态
-  PhotoPosePlugin (actuator)           — 合影姿势
-  SelfCheckPlugin (actuator)           — 启动自检
-  BodyHeightPlugin (actuator)           — 身体高度控制
+  ChassisRawPlugin (actuator)           — 底盘速度控制
 """
 
 import json
@@ -796,6 +790,125 @@ class LaserScanPlugin:
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}
         return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ChassisRawPlugin (actuator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChassisRawPlugin:
+    """底盘速度控制 — 通过 Slamtec REST API MoveByAction 模拟连续运动。
+    每次调用 move_by(direction, 300ms), 每 150ms 刷新一次确保运动不中断。"""
+
+    DIR_NAMES = ["forward", "backward", "right", "left"]
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._max_vx = float(plugin_config.get("max_vx", 0.5))
+        self._max_vyaw = float(plugin_config.get("max_vyaw", 1.0))
+        self._max_duration = float(plugin_config.get("max_duration", 5.0))
+        self._running = False
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "chassis_raw",
+            "type": "actuator",
+            "description": "天轶2.0 底盘速度控制 — 前进/后退/左转/右转, 自动超时停止 (Slamtec MoveByAction)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["move", "stop"],
+                               "description": "控制动作"},
+                    "vx": {"type": "number", "description": "前后速度(m/s), 正=前进"},
+                    "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=左转"},
+                    "duration": {"type": "number", "description": "持续时间(秒), 默认3秒"},
+                },
+                "required": ["action"],
+                "x-action-params": {
+                    "move": {"params": ["vx", "vyaw", "duration"], "description": "移动(duration秒后自动停止)"},
+                    "stop": {"params": [], "description": "立即停止移动"},
+                },
+            },
+        }
+
+    def start(self):
+        print("[ChassisRawPlugin] started (Slamtec MoveByAction mode)")
+
+    def stop(self):
+        self._running = False
+        try:
+            self._slamtec.cancel_current_action()
+        except Exception:
+            pass
+        print("[ChassisRawPlugin] stopped")
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action == "move":
+            try:
+                vx = self._clamp(float(args.get("vx", 0.0)), -self._max_vx, self._max_vx)
+                vyaw = self._clamp(float(args.get("vyaw", 0.0)), -self._max_vyaw, self._max_vyaw)
+                duration = self._clamp(float(args.get("duration", 3.0)), 0.0, self._max_duration)
+            except (TypeError, ValueError):
+                return {"error": "vx, vyaw and duration must be numbers"}
+            return self._start_move(vx, vyaw, duration)
+        elif action == "stop":
+            return self._do_stop()
+        elif action in ("start", "info"):
+            return {"state": "ready"}
+        return {"error": f"unknown action: {action}"}
+
+    def _start_move(self, vx: float, vyaw: float, duration: float) -> dict:
+        # Stop any existing movement first
+        self._running = False
+        time.sleep(0.05)
+
+        # Determine direction: prioritize larger between vx and vyaw
+        if abs(vx) >= abs(vyaw) and vx != 0:
+            direction = 0 if vx > 0 else 1  # forward / backward
+        elif vyaw != 0:
+            direction = 2 if vyaw > 0 else 3  # right / left
+        else:
+            return {"error": "vx and vyaw are both zero"}
+
+        self._running = True
+        threading.Thread(
+            target=self._move_loop, args=(direction, duration), daemon=True
+        ).start()
+
+        return {"vx": vx, "vyaw": vyaw, "duration": duration,
+                "direction": self.DIR_NAMES[direction],
+                "auto_stop": duration > 0}
+
+    def _move_loop(self, direction: int, total_duration: float):
+        """循环调用 MoveByAction, 每 150ms 刷新一次保持运动连续不中断。"""
+        step_interval = 0.15  # 150ms 间隔
+        elapsed = 0.0
+        while self._running and elapsed < total_duration:
+            try:
+                self._slamtec.move_by(direction, 300)  # 300ms 动作, 但 150ms 就刷新
+            except Exception as e:
+                print(f"[ChassisRawPlugin] move_by error: {e}")
+                break
+            time.sleep(step_interval)
+            elapsed += step_interval
+        # 自动停止
+        if self._running:
+            self._do_stop()
+
+    def _do_stop(self) -> dict:
+        self._running = False
+        try:
+            self._slamtec.cancel_current_action()
+        except Exception:
+            pass
+        return {"vx": 0.0, "vyaw": 0.0, "state": "stopped"}
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

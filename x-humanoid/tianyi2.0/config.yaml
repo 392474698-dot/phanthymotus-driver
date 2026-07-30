@@ -32,3 +32,5 @@ plugins:
     enabled: true
   laser_scan:
     enabled: true
+  chassis_raw:
+    enabled: true

@@ -162,6 +162,11 @@ class TianyiDeviceBundle:
             self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
             print("[bundle] LaserScanPlugin loaded")
 
+        if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
+            from device import ChassisRawPlugin
+            self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2, slamtec_client))
+            print("[bundle] ChassisRawPlugin loaded")
+
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
             try:

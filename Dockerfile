@@ -1,9 +1,9 @@
-FROM python:3.10-slim
+FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 
 WORKDIR /work
 
 RUN pip3 install --no-cache-dir \
-    pyyaml py_trees
+    py_trees
 
 ENV PYTHONUNBUFFERED=1
 

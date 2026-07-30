@@ -28,6 +28,7 @@ x-humanoid/tianyi2.0/device.py — 天轶2.0 Pro 设备插件。
   MotorAlarmPlugin (sensor)             — 电机异常报警
   ExceptionPlugin  (sensor)             — 系统异常
   ChassisSafetyPlugin (sensor)          — 底盘安全检测
+  LaserScanPlugin (sensor)              — 激光雷达原始数据
   ChassisRawPlugin (actuator)           — 底盘矢量速度控制
   PackPlugin      (actuator)           — 一键装箱/收纳姿态
   PhotoPosePlugin (actuator)           — 合影姿势
@@ -804,6 +805,61 @@ class ChassisSafetyPlugin:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LaserScanPlugin (sensor)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LaserScanPlugin:
+    """激光雷达原始数据 — 轮询 Slamtec 底盘 laserscan 端点 (5Hz)"""
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
+        self._ns = namespace
+        self._ros2 = ros2
+        self._slamtec = slamtec_client
+        self._topic = f"/{namespace}/state/laser_scan"
+        self._running = False
+
+        self._pub_node = Node("tianyi2_laserscan_pub", context=ros2.ctx_core)
+        ros2.executor_core.add_node(self._pub_node)
+        self._pub = self._pub_node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "laser_scan",
+            "type": "sensor",
+            "description": "天轶2.0 激光雷达原始数据 — 底盘 Slamtec 雷达扫描帧 (5Hz 轮询)",
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+        print("[LaserScanPlugin] polling started")
+
+    def stop(self):
+        self._running = False
+
+    def _poll_loop(self):
+        while self._running:
+            try:
+                data = self._slamtec.get_laser_scan()
+                if data and "error" not in data:
+                    msg = String()
+                    msg.data = json.dumps(data)
+                    self._pub.publish(msg)
+            except Exception:
+                pass
+            time.sleep(0.2)  # 5Hz
+
+    def dispatch(self, action: str, args: dict) -> dict:
+        if action in ("start", "stop", "info"):
+            return {"state": "running" if self._running else "idle",
+                    "topic_out": [{"topic": self._topic, "format": "data/json"}]}
+        return {"state": "running"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ChassisRawPlugin (actuator)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1244,9 +1300,9 @@ class SelfCheckPlugin:
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
-        self._pub_node = Node("tianyi2_selfcheck_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._publisher = None
+        self._srv_node = Node("tianyi2_selfcheck_srv", context=ros2.ctx_tianyi)
+        ros2.executor_tianyi.add_node(self._srv_node)
+        self._client = None
 
     def get_tool(self) -> dict:
         return {
@@ -1269,12 +1325,12 @@ class SelfCheckPlugin:
 
     def start(self):
         try:
-            from std_msgs.msg import Bool
-            self._publisher = self._pub_node.create_publisher(
-                Bool, "/cmd/self_check", _RELIABLE_QOS)
-            print("[SelfCheckPlugin] publisher created")
+            from std_srvs.srv import SetBool
+            self._client = self._srv_node.create_client(
+                SetBool, "/external_node/start_operation")
+            print("[SelfCheckPlugin] service client created")
         except ImportError as e:
-            print(f"[SelfCheckPlugin] WARNING: msg import failed ({e})")
+            print(f"[SelfCheckPlugin] WARNING: srv import failed ({e})")
 
     def stop(self):
         pass
@@ -1287,13 +1343,17 @@ class SelfCheckPlugin:
         return {"error": f"unknown action: {action}"}
 
     def _trigger(self) -> dict:
-        if not self._publisher:
-            return {"error": "publisher not initialized"}
+        if not self._client:
+            return {"error": "service client not initialized"}
+        # Check if service is available (only during "服务等待" state)
+        if not self._client.service_is_ready():
+            return {"error": "自检服务不可用，请确认机器人处于'服务等待'状态（整机状态灯：蓝绿缓慢呼吸）"}
         try:
-            from std_msgs.msg import Bool
-            msg = Bool(); msg.data = True
-            self._publisher.publish(msg)
-            return {"state": "self_check_triggered", "message": "自检流程已触发，请观察整机状态灯"}
+            from std_srvs.srv import SetBool
+            req = SetBool.Request()
+            req.data = True
+            self._client.call_async(req)
+            return {"state": "self_check_triggered", "message": "自检流程已触发，请观察整机状态灯（蓝绿急促呼吸 = 自检中）"}
         except Exception as e:
             return {"error": str(e)}
 

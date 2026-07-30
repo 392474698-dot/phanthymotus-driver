@@ -167,6 +167,11 @@ class TianyiDeviceBundle:
             self._plugins.append(ChassisSafetyPlugin(plugins_cfg["chassis_safety"], namespace, ros2, slamtec_client))
             print("[bundle] ChassisSafetyPlugin loaded")
 
+        if plugins_cfg.get("laser_scan", {}).get("enabled", False):
+            from device import LaserScanPlugin
+            self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
+            print("[bundle] LaserScanPlugin loaded")
+
         if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
             from device import ChassisRawPlugin
             self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2))

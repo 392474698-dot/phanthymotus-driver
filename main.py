@@ -309,11 +309,6 @@ class BTOrchestrator:
         if self._running:
             return {"error": "行为树已在运行中, 请先 stop"}
 
-        try:
-            self._tree.setup(timeout=15)
-        except Exception as e:
-            return {"error": f"setup 失败: {e}"}
-
         self._running = True
         self._tick_thread = threading.Thread(target=self._tick_loop, daemon=True)
         self._tick_thread.start()

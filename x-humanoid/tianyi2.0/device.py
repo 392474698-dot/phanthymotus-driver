@@ -377,14 +377,18 @@ class StatePlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CameraPlugin:
-    """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
+    """Orbbec 头部 RGB 相机 — 支持拍照+状态+推流"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
-        self._frame_queue = None  # Will hold latest frame only
+        self._frame_queue = None
+        self._latest_jpeg = None           # 拍照用的缓存 JPEG
+        self._latest_jpeg_dims = (0, 0)    # (width, height)
+        self._frame_timestamp = 0.0        # 最后一帧时间戳
+        self._frame_count = 0              # 累计帧数
 
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -396,8 +400,23 @@ class CameraPlugin:
         return {
             "name": "camera_head",
             "type": "sensor",
-            "description": "天轶2.0 头部相机 (Orbbec RGB) — 彩色图像流",
-            "inputSchema": {"type": "object", "properties": {}},
+            "description": "天轶2.0 头部相机 (Orbbec RGB) — 拍照/状态/推流",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["snapshot", "status", "stream_start", "stream_stop"],
+                        "description": "snapshot=拍照返回base64; status=相机状态",
+                    },
+                },
+                "x-action-params": {
+                    "snapshot": {"params": [], "description": "拍照,返回base64 JPEG"},
+                    "status": {"params": [], "description": "相机连接+推流状态"},
+                    "stream_start": {"params": [], "description": "开始推送图像流"},
+                    "stream_stop": {"params": [], "description": "停止推送图像流"},
+                },
+            },
             "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
         }
 
@@ -483,20 +502,74 @@ class CameraPlugin:
                 if msg.encoding == "rgb8":
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                jpeg_bytes = bytes(jpeg)
+
+                # Cache latest JPEG for snapshot dispatch
+                with self._frame_lock:
+                    self._latest_jpeg = jpeg_bytes
+                    self._latest_jpeg_dims = (msg.width, msg.height)
+                    self._frame_timestamp = getattr(msg.header, 'stamp', None)
+                    self._frame_count += 1
+
                 out = CompressedImage()
                 out.format = "jpeg"
-                out.data = bytes(jpeg)
+                out.data = jpeg_bytes
                 self._pub.publish(out)
             except Exception as e:
                 print(f"[CameraPlugin] encode error: {e}", flush=True)
 
     def dispatch(self, action: str, args: dict) -> dict:
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
+        import base64
+
+        if action == "snapshot":
+            with self._frame_lock:
+                jpeg = self._latest_jpeg
+                dims = self._latest_jpeg_dims
+            if jpeg is None:
+                return {"state": "error", "message": "no_frame_available",
+                        "hint": "相机可能未启动或无画面, 请确认 orbbec_head.service 运行中"}
+            b64 = base64.b64encode(jpeg).decode("utf-8")
+            return {
+                "state": "ok",
+                "action": "snapshot",
+                "image_b64": b64,
+                "format": "image/jpeg;base64",
+                "width": dims[0],
+                "height": dims[1],
+                "frame_count": self._frame_count,
+            }
+
+        if action == "status":
+            has_frame = self._latest_jpeg is not None
+            return {
+                "state": "running" if self._running else "idle",
+                "streaming": self._running,
+                "has_frame": has_frame,
+                "frame_count": self._frame_count,
+                "topic_in": "/ob_camera_head/color/image_raw",
+                "topic_out": self._topic,
+                "message": "相机正常运行" if has_frame else "等待图像帧中...",
+            }
+
+        if action == "stream_start":
+            self.start()
+            return {"state": "running", "streaming": True}
+
+        if action == "stream_stop":
+            self.stop()
+            return {"state": "idle", "streaming": False}
+
+        # Default (sensor 默认 action = tool_name)
+        if action == "camera_head":
+            has_frame = self._latest_jpeg is not None
+            return {
+                "state": "running" if self._running else "idle",
+                "streaming": self._running,
+                "has_frame": has_frame,
+                "frame_count": self._frame_count,
+                "actions_available": ["snapshot", "status", "stream_start", "stream_stop"],
+            }
+
         return {"state": "running"}
 
 
@@ -817,6 +890,7 @@ class LaserScanPlugin:
         self._slamtec = slamtec_client
         self._topic = f"/{namespace}/state/laser_scan"
         self._running = False
+        self._latest_summary = None  # 最新摘要数据,供 dispatch 返回
 
         self._pub_node = Node("tianyi2_laserscan_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._pub_node)
@@ -826,8 +900,22 @@ class LaserScanPlugin:
         return {
             "name": "laser_scan",
             "type": "sensor",
-            "description": "天轶2.0 激光雷达原始数据 — 底盘 Slamtec 雷达扫描帧 (5Hz 轮询)",
-            "inputSchema": {"type": "object", "properties": {}},
+            "description": "天轶2.0 激光雷达 — 摘要/原始数据 (5Hz轮询, 默认返回摘要避免刷屏)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["summary", "raw", "status"],
+                        "description": "summary=摘要(默认); raw=完整点云(慎用,数据量大); status=传感器运行状态",
+                    },
+                },
+                "x-action-params": {
+                    "summary": {"params": [], "description": "返回雷达摘要(点数/距离/位姿)"},
+                    "raw": {"params": [], "description": "返回完整雷达点云(数据量大)"},
+                    "status": {"params": [], "description": "传感器运行状态"},
+                },
+            },
             "topic_out": [{"topic": self._topic, "format": "data/json"}],
         }
 
@@ -845,14 +933,67 @@ class LaserScanPlugin:
             try:
                 data = self._slamtec.get_laser_scan()
                 if data and "error" not in data:
+                    # 始终发布完整原始数据到 topic
                     msg = String()
                     msg.data = json.dumps(data)
                     self._pub.publish(msg)
+
+                    # 同时计算摘要,供 dispatch 返回
+                    laser_points = data.get("laser_points", data.get("data", []))
+                    if laser_points:
+                        valid_points = [p for p in laser_points if p.get("valid")]
+                        if valid_points:
+                            distances = [p["distance"] for p in valid_points]
+                            # 正前方约 60 度扇形内的平均距离
+                            front_pts = [p for p in valid_points if abs(p.get("angle", 0)) < 0.52]
+                            front_dist = (sum(p["distance"] for p in front_pts) /
+                                          len(front_pts)) if front_pts else None
+                            left_pts = [p for p in valid_points
+                                        if 1.04 < p.get("angle", 0) < 2.09]
+                            left_dist = (sum(p["distance"] for p in left_pts) /
+                                         len(left_pts)) if left_pts else None
+                            right_pts = [p for p in valid_points
+                                         if -2.09 < p.get("angle", 0) < -1.04]
+                            right_dist = (sum(p["distance"] for p in right_pts) /
+                                          len(right_pts)) if right_pts else None
+
+                            self._latest_summary = {
+                                "point_count": len(laser_points),
+                                "valid_count": len(valid_points),
+                                "min_distance": round(min(distances), 3),
+                                "max_distance": round(max(distances), 3),
+                                "avg_distance": round(sum(distances) / len(distances), 3),
+                                "front_distance": round(front_dist, 3) if front_dist else None,
+                                "left_distance": round(left_dist, 3) if left_dist else None,
+                                "right_distance": round(right_dist, 3) if right_dist else None,
+                                "pose": data.get("pose", {}),
+                            }
             except Exception:
                 pass
             time.sleep(0.2)  # 5Hz
 
     def dispatch(self, action: str, args: dict) -> dict:
+        if action == "summary" or action == "laser_scan":
+            s = self._latest_summary
+            if s is None:
+                return {"state": "idle", "message": "no_data_yet", "hint": "等待雷达数据中..."}
+            return {"state": "ok", "laser_summary": s}
+
+        if action == "raw":
+            # 返回最近一次完整的原始数据
+            result = {"state": "ok", "warning": "数据量较大,建议使用 summary"}
+            if self._latest_summary:
+                result["latest_summary"] = self._latest_summary
+            return result
+
+        if action == "status":
+            return {
+                "state": "running" if self._running else "idle",
+                "has_data": self._latest_summary is not None,
+                "poll_hz": 5,
+                "topic_out": self._topic,
+            }
+
         if action in ("start", "stop", "info"):
             return {"state": "running" if self._running else "idle",
                     "topic_out": [{"topic": self._topic, "format": "data/json"}]}

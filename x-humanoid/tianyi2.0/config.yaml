@@ -28,21 +28,7 @@ plugins:
     enabled: true
   chat:
     enabled: true
-  motor_alarm:
-    enabled: true
-  exception:
-    enabled: true
   chassis_safety:
     enabled: true
   laser_scan:
-    enabled: true
-  chassis_raw:
-    enabled: true
-  pack:
-    enabled: true
-  photo_pose:
-    enabled: true
-  self_check:
-    enabled: true
-  body_height:
     enabled: true

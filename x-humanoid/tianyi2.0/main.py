@@ -152,16 +152,6 @@ class TianyiDeviceBundle:
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
             print("[bundle] ChatPlugin loaded")
 
-        if plugins_cfg.get("motor_alarm", {}).get("enabled", False):
-            from device import MotorAlarmPlugin
-            self._plugins.append(MotorAlarmPlugin(plugins_cfg["motor_alarm"], namespace, ros2))
-            print("[bundle] MotorAlarmPlugin loaded")
-
-        if plugins_cfg.get("exception", {}).get("enabled", False):
-            from device import ExceptionPlugin
-            self._plugins.append(ExceptionPlugin(plugins_cfg["exception"], namespace, ros2))
-            print("[bundle] ExceptionPlugin loaded")
-
         if plugins_cfg.get("chassis_safety", {}).get("enabled", False):
             from device import ChassisSafetyPlugin
             self._plugins.append(ChassisSafetyPlugin(plugins_cfg["chassis_safety"], namespace, ros2, slamtec_client))
@@ -171,31 +161,6 @@ class TianyiDeviceBundle:
             from device import LaserScanPlugin
             self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
             print("[bundle] LaserScanPlugin loaded")
-
-        if plugins_cfg.get("chassis_raw", {}).get("enabled", False):
-            from device import ChassisRawPlugin
-            self._plugins.append(ChassisRawPlugin(plugins_cfg["chassis_raw"], namespace, ros2))
-            print("[bundle] ChassisRawPlugin loaded")
-
-        if plugins_cfg.get("pack", {}).get("enabled", False):
-            from device import PackPlugin
-            self._plugins.append(PackPlugin(plugins_cfg["pack"], namespace, ros2))
-            print("[bundle] PackPlugin loaded")
-
-        if plugins_cfg.get("photo_pose", {}).get("enabled", False):
-            from device import PhotoPosePlugin
-            self._plugins.append(PhotoPosePlugin(plugins_cfg["photo_pose"], namespace, ros2))
-            print("[bundle] PhotoPosePlugin loaded")
-
-        if plugins_cfg.get("self_check", {}).get("enabled", False):
-            from device import SelfCheckPlugin
-            self._plugins.append(SelfCheckPlugin(plugins_cfg["self_check"], namespace, ros2))
-            print("[bundle] SelfCheckPlugin loaded")
-
-        if plugins_cfg.get("body_height", {}).get("enabled", False):
-            from device import BodyHeightPlugin
-            self._plugins.append(BodyHeightPlugin(plugins_cfg["body_height"], namespace, ros2))
-            print("[bundle] BodyHeightPlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):

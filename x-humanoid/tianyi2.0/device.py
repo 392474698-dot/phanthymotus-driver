@@ -377,18 +377,14 @@ class StatePlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CameraPlugin:
-    """Orbbec 头部 RGB 相机 — 支持拍照+状态+推流"""
+    """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
-        self._frame_queue = None
-        self._latest_jpeg = None           # 拍照用的缓存 JPEG
-        self._latest_jpeg_dims = (0, 0)    # (width, height)
-        self._frame_timestamp = 0.0        # 最后一帧时间戳
-        self._frame_count = 0              # 累计帧数
+        self._frame_queue = None  # Will hold latest frame only
 
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
@@ -400,23 +396,8 @@ class CameraPlugin:
         return {
             "name": "camera_head",
             "type": "sensor",
-            "description": "天轶2.0 头部相机 (Orbbec RGB) — 拍照/状态/推流",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["snapshot", "status", "stream_start", "stream_stop"],
-                        "description": "snapshot=拍照返回base64; status=相机状态",
-                    },
-                },
-                "x-action-params": {
-                    "snapshot": {"params": [], "description": "拍照,返回base64 JPEG"},
-                    "status": {"params": [], "description": "相机连接+推流状态"},
-                    "stream_start": {"params": [], "description": "开始推送图像流"},
-                    "stream_stop": {"params": [], "description": "停止推送图像流"},
-                },
-            },
+            "description": "天轶2.0 头部相机 (Orbbec RGB) — 彩色图像流",
+            "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "image/jpeg"}],
         }
 
@@ -502,74 +483,20 @@ class CameraPlugin:
                 if msg.encoding == "rgb8":
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 _, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                jpeg_bytes = bytes(jpeg)
-
-                # Cache latest JPEG for snapshot dispatch
-                with self._frame_lock:
-                    self._latest_jpeg = jpeg_bytes
-                    self._latest_jpeg_dims = (msg.width, msg.height)
-                    self._frame_timestamp = getattr(msg.header, 'stamp', None)
-                    self._frame_count += 1
-
                 out = CompressedImage()
                 out.format = "jpeg"
-                out.data = jpeg_bytes
+                out.data = bytes(jpeg)
                 self._pub.publish(out)
             except Exception as e:
                 print(f"[CameraPlugin] encode error: {e}", flush=True)
 
     def dispatch(self, action: str, args: dict) -> dict:
-        import base64
-
-        if action == "snapshot":
-            with self._frame_lock:
-                jpeg = self._latest_jpeg
-                dims = self._latest_jpeg_dims
-            if jpeg is None:
-                return {"state": "error", "message": "no_frame_available",
-                        "hint": "相机可能未启动或无画面, 请确认 orbbec_head.service 运行中"}
-            b64 = base64.b64encode(jpeg).decode("utf-8")
-            return {
-                "state": "ok",
-                "action": "snapshot",
-                "image_b64": b64,
-                "format": "image/jpeg;base64",
-                "width": dims[0],
-                "height": dims[1],
-                "frame_count": self._frame_count,
-            }
-
-        if action == "status":
-            has_frame = self._latest_jpeg is not None
-            return {
-                "state": "running" if self._running else "idle",
-                "streaming": self._running,
-                "has_frame": has_frame,
-                "frame_count": self._frame_count,
-                "topic_in": "/ob_camera_head/color/image_raw",
-                "topic_out": self._topic,
-                "message": "相机正常运行" if has_frame else "等待图像帧中...",
-            }
-
-        if action == "stream_start":
-            self.start()
-            return {"state": "running", "streaming": True}
-
-        if action == "stream_stop":
-            self.stop()
-            return {"state": "idle", "streaming": False}
-
-        # Default (sensor 默认 action = tool_name)
-        if action == "camera_head":
-            has_frame = self._latest_jpeg is not None
-            return {
-                "state": "running" if self._running else "idle",
-                "streaming": self._running,
-                "has_frame": has_frame,
-                "frame_count": self._frame_count,
-                "actions_available": ["snapshot", "status", "stream_start", "stream_stop"],
-            }
-
+        if action == "start":
+            return {"state": "running"}
+        if action == "stop":
+            return {"state": "idle"}
+        if action == "info":
+            return {"state": "running", "topic_out": [{"topic": self._topic, "format": "image/jpeg"}]}
         return {"state": "running"}
 
 

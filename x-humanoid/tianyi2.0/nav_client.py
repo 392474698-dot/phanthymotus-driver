@@ -158,26 +158,6 @@ class SlamtecClient:
             "options": {"gohome_options": {"flags": "dock"}},
         })
 
-    # ── Safety ────────────────────────────────────────────────────────────────
-
-    def get_safety_status(self) -> dict:
-        """获取底盘安全状态"""
-        health = self.get_robot_health()
-        power = self.get_power_status()
-        return {
-            "has_error": health.get("hasError", False),
-            "has_fatal": health.get("hasFatal", False),
-            "has_warning": health.get("hasWarning", False),
-            "emergency_stop": health.get("hasSystemEmergencyStop", False),
-            "lidar_disconnected": health.get("hasLidarDisconnected", False),
-            "depth_camera_disconnected": health.get("hasDepthCameraDisconnected", False),
-            "sdp_disconnected": health.get("hasSdpDisconnected", False),
-            "charging": power.get("isCharging", False),
-            "docking": power.get("dockingStatus", "unknown"),
-            "battery": power.get("batteryPercentage", 0),
-            "power_stage": power.get("powerStage", "unknown"),
-        }
-
     # ── System ────────────────────────────────────────────────────────────────
 
     def get_power_status(self) -> dict:
@@ -191,7 +171,3 @@ class SlamtecClient:
     def get_robot_info(self) -> dict:
         """获取底盘设备信息"""
         return self._get("/api/core/system/v1/robot/info")
-
-    def get_laser_scan(self) -> dict:
-        """获取当前激光观测帧"""
-        return self._get("/api/core/system/v1/laserscan")

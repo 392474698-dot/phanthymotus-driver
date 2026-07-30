@@ -28,9 +28,5 @@ plugins:
     enabled: true
   chat:
     enabled: true
-  chassis_safety:
-    enabled: true
-  laser_scan:
-    enabled: true
   chassis_raw:
     enabled: true

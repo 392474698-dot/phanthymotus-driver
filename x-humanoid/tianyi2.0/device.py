@@ -1005,28 +1005,25 @@ class LaserScanPlugin:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ChassisRawPlugin:
-    """底盘矢量速度控制 — 任意方向+旋转 (底层 /cmd_vel, 10Hz 持续发布)"""
+    """底盘速度控制 — 通过 Slamtec REST API MoveByAction 模拟连续运动。
+    每次调用 move_by(direction, 300ms), 每 150ms 刷新一次确保运动不中断。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
+    DIR_NAMES = ["forward", "backward", "right", "left"]
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
         self._ns = namespace
         self._ros2 = ros2
-        self._vel_pub = None
-        self._pub_node = Node("tianyi2_chassis_raw_pub", context=ros2.ctx_tianyi)
-        ros2.executor_tianyi.add_node(self._pub_node)
-        self._running = False
-        self._vx = 0.0
-        self._vy = 0.0
-        self._vyaw = 0.0
+        self._slamtec = slamtec_client
         self._max_vx = float(plugin_config.get("max_vx", 0.5))
-        self._max_vy = float(plugin_config.get("max_vy", 0.5))
         self._max_vyaw = float(plugin_config.get("max_vyaw", 1.0))
         self._max_duration = float(plugin_config.get("max_duration", 5.0))
+        self._running = False
 
     def get_tool(self) -> dict:
         return {
             "name": "chassis_raw",
             "type": "actuator",
-            "description": "天轶2.0 底盘矢量速度 — 任意方向+旋转 (底层 /cmd_vel, 10Hz, 自动超时停)",
+            "description": "天轶2.0 底盘速度控制 — 前进/后退/左转/右转, 自动超时停止 (Slamtec MoveByAction)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1034,110 +1031,92 @@ class ChassisRawPlugin:
                                "enum": ["move", "stop"],
                                "description": "控制动作"},
                     "vx": {"type": "number", "description": "前后速度(m/s), 正=前进"},
-                    "vy": {"type": "number", "description": "左右速度(m/s), 正=左移"},
-                    "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=逆时针"},
-                    "duration": {"type": "number", "description": "持续时间(秒), move时有效, 到时间自动停止; 默认3秒"},
+                    "vyaw": {"type": "number", "description": "旋转速度(rad/s), 正=左转"},
+                    "duration": {"type": "number", "description": "持续时间(秒), 默认3秒"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "move": {"params": ["vx", "vy", "vyaw", "duration"], "description": "移动(duration秒后自动停止)"},
+                    "move": {"params": ["vx", "vyaw", "duration"], "description": "移动(duration秒后自动停止)"},
                     "stop": {"params": [], "description": "立即停止移动"},
                 },
             },
         }
 
     def start(self):
-        try:
-            from geometry_msgs.msg import Twist
-            self._vel_pub = self._pub_node.create_publisher(Twist, "/cmd_vel", _RELIABLE_QOS)
-            print("[ChassisRawPlugin] publisher created")
-        except ImportError as e:
-            print(f"[ChassisRawPlugin] WARNING: msg import failed ({e})")
+        print("[ChassisRawPlugin] started (Slamtec MoveByAction mode)")
 
     def stop(self):
-        self._cancel_auto_stop()
-        self._stop_publish()
-        if self._vel_pub:
-            try:
-                from geometry_msgs.msg import Twist
-                self._vel_pub.publish(Twist())
-            except Exception:
-                pass
+        self._running = False
+        try:
+            self._slamtec.cancel_current_action()
+        except Exception:
+            pass
+        print("[ChassisRawPlugin] stopped")
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move":
             try:
                 vx = self._clamp(float(args.get("vx", 0.0)), -self._max_vx, self._max_vx)
-                vy = self._clamp(float(args.get("vy", 0.0)), -self._max_vy, self._max_vy)
                 vyaw = self._clamp(float(args.get("vyaw", 0.0)), -self._max_vyaw, self._max_vyaw)
                 duration = self._clamp(float(args.get("duration", 3.0)), 0.0, self._max_duration)
             except (TypeError, ValueError):
-                return {"error": "vx, vy, vyaw and duration must be numbers"}
-            return self._start_move(vx, vy, vyaw, duration)
+                return {"error": "vx, vyaw and duration must be numbers"}
+            return self._start_move(vx, vyaw, duration)
         elif action == "stop":
             return self._do_stop()
         elif action in ("start", "info"):
             return {"state": "ready"}
         return {"error": f"unknown action: {action}"}
 
-    def _start_move(self, vx: float, vy: float, vyaw: float, duration: float = 3.0) -> dict:
-        if not self._vel_pub:
-            return {"error": "publisher not initialized"}
-        # Cancel previous auto-stop timer
-        self._cancel_auto_stop()
-        self._vx, self._vy, self._vyaw = vx, vy, vyaw
+    def _start_move(self, vx: float, vyaw: float, duration: float) -> dict:
+        # Stop any existing movement first
+        self._running = False
+        time.sleep(0.05)
+
+        # Determine direction: prioritize larger between vx and vyaw
+        if abs(vx) >= abs(vyaw) and vx != 0:
+            direction = 0 if vx > 0 else 1  # forward / backward
+        elif vyaw != 0:
+            direction = 2 if vyaw > 0 else 3  # right / left
+        else:
+            return {"error": "vx and vyaw are both zero"}
+
         self._running = True
-        if not hasattr(self, '_pub_thread') or not (self._pub_thread and self._pub_thread.is_alive()):
-            self._pub_thread = threading.Thread(target=self._publish_loop, daemon=True)
-            self._pub_thread.start()
-        # Schedule auto-stop if duration is positive
-        if duration > 0:
-            self._auto_stop_timer = threading.Timer(duration, self._do_stop)
-            self._auto_stop_timer.daemon = True
-            self._auto_stop_timer.start()
-        return {"vx": vx, "vy": vy, "vyaw": vyaw, "duration": duration, "auto_stop": duration > 0}
+        threading.Thread(
+            target=self._move_loop, args=(direction, duration), daemon=True
+        ).start()
+
+        return {"vx": vx, "vyaw": vyaw, "duration": duration,
+                "direction": self.DIR_NAMES[direction],
+                "auto_stop": duration > 0}
+
+    def _move_loop(self, direction: int, total_duration: float):
+        """循环调用 MoveByAction, 每 150ms 刷新一次保持运动连续不中断。"""
+        step_interval = 0.15  # 150ms 间隔
+        elapsed = 0.0
+        while self._running and elapsed < total_duration:
+            try:
+                self._slamtec.move_by(direction, 300)  # 300ms 动作, 但 150ms 就刷新
+            except Exception as e:
+                print(f"[ChassisRawPlugin] move_by error: {e}")
+                break
+            time.sleep(step_interval)
+            elapsed += step_interval
+        # 自动停止
+        if self._running:
+            self._do_stop()
+
+    def _do_stop(self) -> dict:
+        self._running = False
+        try:
+            self._slamtec.cancel_current_action()
+        except Exception:
+            pass
+        return {"vx": 0.0, "vyaw": 0.0, "state": "stopped"}
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
-
-    def _cancel_auto_stop(self):
-        timer = getattr(self, '_auto_stop_timer', None)
-        if timer and timer.is_alive():
-            timer.cancel()
-
-    def _do_stop(self) -> dict:
-        """Stop movement — publish zero velocity and stop publish loop."""
-        self._running = False
-        self._cancel_auto_stop()
-        if self._vel_pub:
-            try:
-                from geometry_msgs.msg import Twist
-                self._vel_pub.publish(Twist())  # zero velocity
-            except Exception:
-                pass
-        return {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "state": "stopped"}
-
-    def _stop_publish(self):
-        self._running = False
-
-    def _publish_loop(self):
-        from geometry_msgs.msg import Twist
-        while self._running:
-            try:
-                twist = Twist()
-                twist.linear.x = self._vx
-                twist.linear.y = self._vy
-                twist.angular.z = self._vyaw
-                self._vel_pub.publish(twist)
-            except Exception:
-                pass
-            time.sleep(0.1)  # 10Hz
-        # send zero on stop
-        try:
-            self._vel_pub.publish(Twist())
-        except Exception:
-            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -4293,6 +4293,7 @@ class RobotFaultsPlugin:
         chassis_lines = []
         if cd is None:
             chassis_lines.append("离线")
+            issues.append("底盘离线，无法获取安全状态")
         elif chassis_ok:
             chassis_lines.append("正常")
         else:
@@ -4327,6 +4328,7 @@ class RobotFaultsPlugin:
             issues.append(f"关节过温: {', '.join(hot_motors)}")
         if not self._body_available:
             motor_status = "离线"
+            issues.append("身体关节离线，无法获取电机状态")
         subsystems["motors"] = {
             "healthy": motor_ok and not hot_motors,
             "available": self._body_available,
@@ -4377,6 +4379,7 @@ class RobotFaultsPlugin:
         else:
             power_lines.append("离线")
             power_ok = False
+            issues.append("电源板离线，无法获取电池状态")
         subsystems["power"] = {
             "healthy": power_ok,
             "available": pw is not None,

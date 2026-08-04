@@ -4049,8 +4049,7 @@ class RobotFaultsPlugin:
             "power_topic": "/power/board/status",
             "estop_topic": "/power/board/key_status",
             "node_state_topics": [
-                "/head/node_state", "/arm/node_state",
-                "/waist/node_state", "/leg/node_state",
+                "/node/status",
             ],
         }
 

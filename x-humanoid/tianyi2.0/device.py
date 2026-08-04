@@ -4048,6 +4048,10 @@ class RobotFaultsPlugin:
             },
             "power_topic": "/power/board/status",
             "estop_topic": "/power/board/key_status",
+            "node_state_topics": [
+                "/head/node_state", "/arm/node_state",
+                "/waist/node_state", "/leg/node_state",
+            ],
         }
 
     _FINGER_NAMES = ["小指", "无名指", "中指", "食指", "拇指弯", "拇指转"]
@@ -4066,6 +4070,7 @@ class RobotFaultsPlugin:
         self._hand_state_topics = cfg["hand_state_topics"]
         self._power_topic    = cfg["power_topic"]
         self._estop_topic    = cfg["estop_topic"]
+        self._node_state_topics = cfg.get("node_state_topics", [])
 
         # 缓存
         self._chassis_data   = None   # safety_status
@@ -4077,6 +4082,7 @@ class RobotFaultsPlugin:
         self._body_sources   = {}
         self._motor_details  = {}     # motor_id → {pos,speed,current,temp,error}
         self._estop_state    = {"physical": False, "remote": False}
+        self._node_states    = {}     # part → 0=IDLE / 1=RUNNING
         self._last_update_ms = None
         self._lock = threading.Lock()
 
@@ -4140,8 +4146,19 @@ class RobotFaultsPlugin:
                 PowerBoardKeyStatus, self._estop_topic,
                 self._on_estop, _RELIABLE_QOS)
 
+            # NodeState: 各部位自检状态 (IDLE=0 自检中, RUNNING=1 就绪)
+            from bodyctrl_msgs.msg import NodeState
+            for ns_topic in self._node_state_topics:
+                try:
+                    self._sub_node.create_subscription(
+                        NodeState, ns_topic,
+                        lambda msg, t=ns_topic: self._on_node_state(msg, t),
+                        _RELIABLE_QOS)
+                except Exception as e:
+                    print(f"[RobotFaultsPlugin] node_state topic {ns_topic} failed: {e}")
+
             self._body_available = True
-            print("[RobotFaultsPlugin] all subscriptions created (motors + hands + power + estop)")
+            print("[RobotFaultsPlugin] all subscriptions created (motors + hands + power + estop + node_state)")
         except ImportError as e:
             print(f"[RobotFaultsPlugin] ROS2 msgs unavailable ({e}), body disabled")
 
@@ -4280,6 +4297,12 @@ class RobotFaultsPlugin:
                 }
             self._body_sources[self._estop_topic] = now_ms
             self._last_update_ms = now_ms
+
+    def _on_node_state(self, msg, source_topic: str):
+        """NodeState: IDLE=0(自检中), RUNNING=1(就绪)"""
+        part = msg.topic if msg.topic else source_topic.split("/")[-2]
+        with self._lock:
+            self._node_states[part] = int(msg.state)
 
     # ── 体检报告生成 ──────────────────────────────────────────────────────
 
@@ -4420,6 +4443,28 @@ class RobotFaultsPlugin:
             "available": imu is not None,
             "status": "正常" if imu_ok else "异常",
             "detail": ", ".join(imu_lines),
+        }
+
+        # ── 自检状态 ──
+        ns = self._node_states
+        if ns:
+            running = [k for k, v in ns.items() if v == 1]
+            idling  = [k for k, v in ns.items() if v == 0]
+            sc_ok = len(idling) == 0
+            sc_status = "完成" if sc_ok else f"自检中({len(idling)}个)"
+            sc_detail = f"就绪:{','.join(running) if running else '无'} | 自检中:{','.join(idling) if idling else '无'}"
+        elif self._body_available:
+            sc_ok = True
+            sc_status = "未知"
+            sc_detail = "无NodeState数据，推测已就绪(body数据正常)"
+        else:
+            sc_ok = False
+            sc_status = "离线"
+            sc_detail = "身体控制器离线"
+        subsystems["self_check"] = {
+            "healthy": sc_ok,
+            "status": sc_status,
+            "detail": sc_detail,
         }
 
         # ── 综合判断 ──

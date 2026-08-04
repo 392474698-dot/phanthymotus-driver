@@ -4031,8 +4031,8 @@ class RemoteStatePlugin:
         return {"state": "error", "error": "INVALID_ARGUMENT",
                 "message": f"unknown action: {action}"}
 class RobotFaultsPlugin:
-    """全机故障汇总 — 底盘 (Slamtec HTTP) + 身体电机/灵巧手/急停 (ROS2 订阅), 1Hz 发布。
-    bodyctrl_msgs 不可用时身体部分自动降级为 unavailable。"""
+    """全身体检卡 — 底盘安全 + 身体电机/灵巧手/急停 + 电源 + 手部 + IMU + 自检状态
+    综合诊断结论 + 可行建议。"""
 
     @staticmethod
     def _default_config() -> dict:
@@ -4042,8 +4042,15 @@ class RobotFaultsPlugin:
                 "left": "/inspire_hand/error/left_hand",
                 "right": "/inspire_hand/error/right_hand",
             },
+            "hand_state_topics": {
+                "left": "/inspire_hand/state/left_hand",
+                "right": "/inspire_hand/state/right_hand",
+            },
+            "power_topic": "/power/board/status",
             "estop_topic": "/power/board/key_status",
         }
+
+    _FINGER_NAMES = ["小指", "无名指", "中指", "食指", "拇指弯", "拇指转"]
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, slamtec_client):
         cfg = self._default_config()
@@ -4052,21 +4059,27 @@ class RobotFaultsPlugin:
         self._ros2 = ros2
         self._slamtec = slamtec_client
         self._running = False
-
-        # 身体故障源配置
-        self._motor_topics = cfg["motor_status_topics"]
-        self._hand_topics = cfg["hand_error_topics"]
-        self._estop_topic = cfg["estop_topic"]
-
-        # 状态
-        self._chassis_data = None
-        self._body_faults = {}
-        self._body_sources = {}
         self._body_available = False
+
+        self._motor_topics   = cfg["motor_status_topics"]
+        self._hand_error_topics = cfg["hand_error_topics"]
+        self._hand_state_topics = cfg["hand_state_topics"]
+        self._power_topic    = cfg["power_topic"]
+        self._estop_topic    = cfg["estop_topic"]
+
+        # 缓存
+        self._chassis_data   = None   # safety_status
+        self._chassis_health = None   # robot/health
+        self._imu_data       = None   # rawimu
+        self._power_data     = None   # PowerStatus
+        self._hand_state     = {"left": None, "right": None}  # JointState
+        self._body_faults    = {}
+        self._body_sources   = {}
+        self._motor_details  = {}     # motor_id → {pos,speed,current,temp,error}
+        self._estop_state    = {"physical": False, "remote": False}
         self._last_update_ms = None
         self._lock = threading.Lock()
 
-        # 订阅节点 (domain 0) — 接收身体故障
         self._sub_node = Node("tianyi2_robot_faults_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
@@ -4074,16 +4087,16 @@ class RobotFaultsPlugin:
         return {
             "name": "robot_faults",
             "type": "actuator",
-            "description": "天轶2.0 全机故障检查 — 底盘安全 + 身体电机/灵巧手/急停",
+            "description": "天轶2.0 全身体检 — 底盘/电机/手部/电源/急停/IMU 综合诊断, 含建议",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["summary"],
-                               "description": "summary=关键摘要"},
+                               "description": "summary=全身体检报告"},
                 },
                 "required": ["action"],
                 "x-action-params": {
-                    "summary": {"params": [], "description": "返回关键摘要: 底盘状态/急停/身体故障数"},
+                    "summary": {"params": [], "description": "返回全身体检结论: 各子系统状态 + 综合建议"},
                 },
             },
         }
@@ -4093,70 +4106,104 @@ class RobotFaultsPlugin:
     def start(self):
         self._running = True
 
-        # 底盘采集线程 (HTTP, 5Hz)
-        threading.Thread(target=self._chassis_poll_loop, daemon=True).start()
+        # 底盘 + IMU 采集线程 (HTTP, 5Hz)
+        threading.Thread(target=self._http_poll_loop, daemon=True).start()
 
-        # 身体 ROS2 订阅 (失败则降级)
+        # ROS2 订阅 (失败则降级)
         try:
-            from bodyctrl_msgs.msg import MotorStatusMsg, PowerBoardKeyStatus
+            from bodyctrl_msgs.msg import MotorStatusMsg, PowerStatus, PowerBoardKeyStatus
+            from sensor_msgs.msg import JointState
+
             for src_topic in self._motor_topics:
                 self._sub_node.create_subscription(
                     MotorStatusMsg, src_topic,
                     lambda msg, t=src_topic: self._on_motor_status(msg, t),
                     _RELIABLE_QOS)
-            for side, src_topic in self._hand_topics.items():
+
+            for side, src_topic in self._hand_error_topics.items():
                 self._sub_node.create_subscription(
                     UInt32MultiArray, src_topic,
                     lambda msg, h=side, t=src_topic: self._on_hand_error(msg, h, t),
                     _RELIABLE_QOS)
+
+            for side, src_topic in self._hand_state_topics.items():
+                self._sub_node.create_subscription(
+                    JointState, src_topic,
+                    lambda msg, h=side: self._on_hand_state(msg, h),
+                    _RELIABLE_QOS)
+
+            self._sub_node.create_subscription(
+                PowerStatus, self._power_topic,
+                self._on_power_status, _RELIABLE_QOS)
+
             self._sub_node.create_subscription(
                 PowerBoardKeyStatus, self._estop_topic,
                 self._on_estop, _RELIABLE_QOS)
-            self._body_available = True
-            print("[RobotFaultsPlugin] body subscriptions created")
-        except ImportError as e:
-            print(f"[RobotFaultsPlugin] bodyctrl_msgs not available ({e}), body disabled")
 
-        # 完整数据发布线程 (1Hz → topic)
+            self._body_available = True
+            print("[RobotFaultsPlugin] all subscriptions created (motors + hands + power + estop)")
+        except ImportError as e:
+            print(f"[RobotFaultsPlugin] ROS2 msgs unavailable ({e}), body disabled")
+
         print("[RobotFaultsPlugin] started")
 
     def stop(self):
         self._running = False
 
-    # ── 底盘 HTTP 轮询 (5Hz) ──────────────────────────────────────────────
+    # ── HTTP 轮询 (底盘 5Hz + IMU 5Hz + health 每5次) ────────────────────
 
-    def _chassis_poll_loop(self):
+    def _http_poll_loop(self):
+        tick = 0
         while self._running:
             try:
                 data = self._slamtec.get_safety_status()
-                if data:
+                if data and "error" not in data:
                     with self._lock:
                         self._chassis_data = data
                         self._last_update_ms = int(time.time() * 1000)
             except Exception:
                 pass
-            time.sleep(0.2)  # 5Hz
+            try:
+                imu = self._slamtec.get_raw_imu()
+                if imu and "error" not in imu:
+                    with self._lock:
+                        self._imu_data = imu
+            except Exception:
+                pass
+            if tick % 5 == 0:
+                try:
+                    health = self._slamtec.get_robot_health()
+                    if health and "error" not in health:
+                        with self._lock:
+                            self._chassis_health = health
+                except Exception:
+                    pass
+            tick += 1
+            time.sleep(0.2)
 
-    # ── 身体 ROS2 回调 ────────────────────────────────────────────────────
+    # ── ROS2 回调 ─────────────────────────────────────────────────────────
 
     def _on_motor_status(self, msg, source_topic: str):
         now_ms = int(time.time() * 1000)
         with self._lock:
             for motor in msg.status:
                 motor_id = int(motor.name)
+                self._motor_details[motor_id] = {
+                    "pos": float(motor.pos), "speed": float(motor.speed),
+                    "current": float(motor.current), "temp": float(motor.temperature),
+                    "error": int(motor.error),
+                }
                 fault_id = f"motor:{motor_id}"
                 if int(motor.error) == 0:
                     self._body_faults.pop(fault_id, None)
                     continue
                 self._body_faults[fault_id] = {
-                    "fault_id": fault_id,
-                    "category": "motor",
+                    "fault_id": fault_id, "category": "motor",
                     "motor_id": motor_id,
                     "component": _ALL_JOINTS.get(motor_id, f"motor_{motor_id}"),
                     "error_code": int(motor.error),
                     "error_desc": _MOTOR_ERROR_DESCRIPTIONS.get(int(motor.error), "unknown"),
-                    "severity": "error",
-                    "source_topic": source_topic,
+                    "severity": "error", "source_topic": source_topic,
                 }
             self._body_sources[source_topic] = now_ms
             self._last_update_ms = now_ms
@@ -4173,15 +4220,45 @@ class RobotFaultsPlugin:
                     continue
                 fid = f"{prefix}{idx}"
                 self._body_faults[fid] = {
-                    "fault_id": fid,
-                    "category": "hand",
+                    "fault_id": fid, "category": "hand",
                     "component": f"{side}_hand_error_channel_{idx}",
-                    "error_code": code,
-                    "severity": "error",
+                    "error_code": code, "severity": "error",
                     "source_topic": source_topic,
                 }
             self._body_sources[source_topic] = now_ms
             self._last_update_ms = now_ms
+
+    def _on_hand_state(self, msg, side: str):
+        with self._lock:
+            self._hand_state[side] = {
+                "positions": [round(p, 4) for p in msg.position],
+                "velocities": [round(v, 4) for v in msg.velocity],
+                "efforts": [round(e, 4) for e in msg.effort],
+            }
+
+    def _on_power_status(self, msg):
+        with self._lock:
+            self._power_data = {
+                "mos_temp": {
+                    "waist": float(msg.waist_temp), "arm_a": float(msg.arm_a_temp),
+                    "arm_b": float(msg.arm_b_temp), "leg_a": float(msg.leg_a_temp),
+                    "leg_b": float(msg.leg_b_temp),
+                },
+                "current": {
+                    "waist": float(msg.waist_curr), "arm_a": float(msg.arm_a_curr),
+                    "arm_b": float(msg.arm_b_curr), "leg_a": float(msg.leg_a_curr),
+                    "leg_b": float(msg.leg_b_curr),
+                    "head": float(msg.head_curr),
+                },
+                "voltage": {
+                    "waist": float(msg.waist_volt), "arm_a": float(msg.arm_a_volt),
+                    "arm_b": float(msg.arm_b_volt), "leg_a": float(msg.leg_a_volt),
+                    "leg_b": float(msg.leg_b_volt),
+                    "bus": float(msg.bus_volt),
+                },
+                "battery_pct": float(msg.battery_power),
+                "battery_voltage": float(msg.battery_voltage),
+            }
 
     def _on_estop(self, msg):
         now_ms = int(time.time() * 1000)
@@ -4190,95 +4267,211 @@ class RobotFaultsPlugin:
             "remote": bool(msg.is_remote_estop.data),
         }
         with self._lock:
+            self._estop_state = states
             for kind, active in states.items():
                 fid = f"estop:{kind}"
                 if not active:
                     self._body_faults.pop(fid, None)
                     continue
                 self._body_faults[fid] = {
-                    "fault_id": fid,
-                    "category": "estop",
-                    "component": f"{kind}_estop",
-                    "error_code": 1,
-                    "severity": "fatal",
-                    "source_topic": self._estop_topic,
+                    "fault_id": fid, "category": "estop",
+                    "component": f"{kind}_estop", "error_code": 1,
+                    "severity": "fatal", "source_topic": self._estop_topic,
                 }
             self._body_sources[self._estop_topic] = now_ms
             self._last_update_ms = now_ms
 
-    # ── 按需查询执行器 ─────────────────────────────────────────────────────
+    # ── 体检报告生成 ──────────────────────────────────────────────────────
 
     def _build_summary_locked(self) -> dict:
-        """生成关键摘要，每次 dispatch 调用时读取最新快照。"""
+        subsystems = {}
+        issues = []
 
-        # 底盘
-        chassis_available = self._chassis_data is not None
-        chassis_healthy = chassis_available and not self._chassis_data.get("has_error") \
-                          and not self._chassis_data.get("has_fatal")
+        # ── 底盘 ──
+        cd = self._chassis_data
+        chassis_ok = cd is not None and not cd.get("has_error") and not cd.get("has_fatal")
         chassis_lines = []
-        if not chassis_available:
+        if cd is None:
             chassis_lines.append("离线")
-        elif not chassis_healthy:
-            chassis_lines.append("异常")
-        else:
+        elif chassis_ok:
             chassis_lines.append("正常")
-        if chassis_available:
-            d = self._chassis_data
-            if d.get("emergency_stop"):
+        else:
+            chassis_lines.append("异常")
+            if cd.get("has_fatal"):
+                chassis_lines.append("致命错误")
+        if cd:
+            if cd.get("emergency_stop"):
                 chassis_lines.append("急停!")
-            if d.get("lidar_disconnected"):
+                issues.append("底盘急停触发")
+            if cd.get("lidar_disconnected"):
                 chassis_lines.append("雷达离线")
+                issues.append("激光雷达离线")
+        subsystems["chassis"] = {
+            "healthy": chassis_ok,
+            "available": cd is not None,
+            "status": " ".join(chassis_lines),
+            "detail": ", ".join(chassis_lines),
+        }
 
-        # 身体
-        body_faults = sorted(self._body_faults.values(), key=lambda f: f["fault_id"])
-        body_lines = []
+        # ── 电机 ──
+        motor_faults = [f for f in self._body_faults.values() if f["category"] == "motor"]
+        motor_ok = self._body_available and not motor_faults
+        hot_motors = []
+        for mid, d in self._motor_details.items():
+            if d["temp"] > 55:
+                name = _ALL_JOINTS.get(mid, f"motor_{mid}")
+                hot_motors.append(f"{name} {d['temp']:.0f}°C")
+        motor_status = "正常" if motor_ok else f"{len(motor_faults)}个故障"
+        if hot_motors:
+            motor_status = "警告"
+            issues.append(f"关节过温: {', '.join(hot_motors)}")
         if not self._body_available:
-            body_lines.append("离线")
-        elif not body_faults:
-            body_lines.append("正常")
-        else:
-            for f in body_faults:
-                body_lines.append(f"{f['component']}({f.get('error_desc', f['error_code'])})")
+            motor_status = "离线"
+        subsystems["motors"] = {
+            "healthy": motor_ok and not hot_motors,
+            "available": self._body_available,
+            "status": motor_status,
+            "fault_count": len(motor_faults),
+            "hot_joints": hot_motors,
+            "detail": "正常" if motor_ok and not hot_motors else ", ".join(
+                [f"{f['component']}({f.get('error_desc','?')})" for f in motor_faults] + hot_motors),
+        }
 
-        # 生成人类可读总结段落
-        body_fault_count = len(body_faults)
-        if chassis_healthy and self._body_available and body_fault_count == 0:
-            summary_text = "机器人状态良好，底盘运动系统正常，身体各关节无故障。"
+        # ── 手部 ──
+        hand_faults = [f for f in self._body_faults.values() if f["category"] == "hand"]
+        hand_ok = not hand_faults
+        hand_parts = []
+        for side_key in ("left", "right"):
+            hs = self._hand_state.get(side_key)
+            if hs and hs["positions"]:
+                avg_pos = sum(hs["positions"]) / len(hs["positions"])
+                grip = "握拳" if avg_pos > 0.7 else "半握" if avg_pos > 0.3 else "展开"
+                hand_parts.append(f"{'左' if side_key=='left' else '右'}手:{grip}")
+        hand_status = "正常" if hand_ok else f"{len(hand_faults)}个故障"
+        subsystems["hands"] = {
+            "healthy": hand_ok,
+            "available": bool(hand_parts),
+            "status": hand_status,
+            "detail": ", ".join(hand_parts) if hand_parts else "无数据",
+        }
+
+        # ── 电源 ──
+        pw = self._power_data
+        power_ok = True
+        power_lines = []
+        if pw:
+            pct = pw.get("battery_pct")
+            if pct is not None:
+                power_lines.append(f"电池{pct:.0f}%")
+                if pct < 20:
+                    power_ok = False
+                    issues.append(f"电池电量低({pct:.0f}%)")
+            v = pw.get("battery_voltage")
+            if v is not None:
+                power_lines.append(f"{v:.1f}V")
+            mt = pw.get("mos_temp", {})
+            high_mos = [f"{k} {mt[k]:.0f}°C" for k, v in mt.items() if v > 70]
+            if high_mos:
+                issues.append(f"MOS温度偏高: {', '.join(high_mos)}")
+                power_ok = False
         else:
-            parts = []
-            if not chassis_healthy:
-                parts.append("底盘系统异常")
-            elif chassis_available:
-                parts.append("底盘正常")
-            if not self._body_available:
-                parts.append("身体关节数据无法获取")
-            elif body_fault_count > 0:
-                fault_desc = "，".join(
-                    f"{f['component']}({f.get('error_desc', f['error_code'])})"
-                    for f in body_faults[:3])
-                if body_fault_count > 3:
-                    fault_desc += f" 等{body_fault_count}个故障"
-                parts.append(f"检测到身体故障: {fault_desc}")
-            else:
-                parts.append("身体关节正常")
-            summary_text = "；".join(parts) + "。"
+            power_lines.append("离线")
+            power_ok = False
+        subsystems["power"] = {
+            "healthy": power_ok,
+            "available": pw is not None,
+            "status": "正常" if power_ok else "异常",
+            "detail": ", ".join(power_lines),
+        }
+
+        # ── 急停 ──
+        estop_active = self._estop_state.get("physical") or self._estop_state.get("remote")
+        estop_status = "触发!" if estop_active else "正常"
+        if estop_active:
+            issues.append("急停按钮已触发")
+        subsystems["estop"] = {
+            "healthy": not estop_active,
+            "status": estop_status,
+            "detail": "物理急停" if self._estop_state.get("physical") else (
+                "遥控急停" if self._estop_state.get("remote") else "未触发"),
+        }
+
+        # ── IMU ──
+        imu = self._imu_data
+        imu_ok = imu is not None
+        imu_lines = []
+        if imu:
+            acc_x = float(imu.get("acc_x", 0))
+            acc_y = float(imu.get("acc_y", 0))
+            acc_z = float(imu.get("acc_z", 0))
+            tilt = math.atan2(acc_x, acc_z) * 180 / math.pi  # 前后倾角(度)
+            imu_lines.append(f"tilt {tilt:.1f}°")
+            if abs(tilt) > 15:
+                imu_ok = False
+                issues.append(f"机器人倾角过大 ({tilt:.0f}°)")
+        else:
+            imu_lines.append("离线")
+            imu_ok = False
+        subsystems["imu"] = {
+            "healthy": imu_ok,
+            "available": imu is not None,
+            "status": "正常" if imu_ok else "异常",
+            "detail": ", ".join(imu_lines),
+        }
+
+        # ── 综合判断 ──
+        all_healthy = all(s["healthy"] for s in subsystems.values())
+        ready = all_healthy and not estop_active
+
+        # ── 建议 ──
+        advice = None
+        if motor_faults:
+            comps = [f["component"] for f in motor_faults[:3]]
+            advice = {
+                "action": "manual_self_check",
+                "target": ", ".join(comps),
+                "reason": f"检测到{len(motor_faults)}个电机故障",
+                "suggestion": f"建议使用遥控器对{comps[0]}等关节手动自检，确认清除后状态正常",
+            }
+        elif hot_motors:
+            advice = {
+                "action": "cool_down",
+                "target": hot_motors[0].split()[0],
+                "reason": f"关节温度偏高: {hot_motors[0]}",
+                "suggestion": f"建议暂停负载5分钟，降温后使用遥控器手动自检",
+            }
+        elif estop_active:
+            advice = {
+                "action": "release_estop",
+                "target": "全机",
+                "reason": "急停按钮已触发",
+                "suggestion": "解除急停后，建议使用遥控器全机自检确认无异常后再运动",
+            }
+        elif issues:
+            advice = {
+                "action": "check",
+                "target": "全机",
+                "reason": issues[0],
+                "suggestion": "检测到异常，建议使用遥控器手动自检",
+            }
+
+        # ── 生成人类可读结论 ──
+        if all_healthy:
+            summary_text = "全身体检通过：底盘、电机、手部、电源、急停、IMU 均正常。"
+        else:
+            statuses = [f"{k}:{v['status']}" for k, v in subsystems.items()]
+            summary_text = "；".join(statuses) + "。"
+            if advice:
+                summary_text += " " + advice["suggestion"]
+        if not ready:
+            summary_text += " 注意：机器人当前不可运动。"
 
         return {
-            "healthy": chassis_healthy and self._body_available and not body_faults,
+            "healthy": all_healthy,
+            "ready_to_move": ready,
             "summary_text": summary_text,
-            "summary": ", ".join(chassis_lines + body_lines),
-            "chassis": {
-                "available": chassis_available,
-                "healthy": chassis_healthy,
-                "emergency_stop": self._chassis_data.get("emergency_stop", False) if chassis_available else None,
-                "detail": ", ".join(chassis_lines),
-            },
-            "body": {
-                "available": self._body_available,
-                "fault_count": len(body_faults),
-                "faults": body_faults if body_faults else [],
-                "detail": ", ".join(body_lines),
-            },
+            "subsystems": subsystems,
+            "advice": advice,
         }
 
     def dispatch(self, action: str, args: dict) -> dict:

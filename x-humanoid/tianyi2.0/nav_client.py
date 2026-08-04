@@ -302,6 +302,10 @@ class SlamtecClient:
         """获取当前激光观测帧"""
         return self._get("/api/core/system/v1/laserscan")
 
+    def get_raw_imu(self) -> dict:
+        """获取原始IMU数据 (加速度/角速度/姿态角)"""
+        return self._get("/api/core/system/v1/rawimu")
+
     # ── Mapping (建图) ─────────────────────────────────────────────────────────
 
     def start_mapping(self) -> dict:

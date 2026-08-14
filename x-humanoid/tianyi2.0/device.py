@@ -2613,6 +2613,9 @@ class ArmPlugin:
         (-170, 170), (-45, 60), (-75, 95),
     ]
 
+    # Trajectory publishing rate and time quantum.
+    _TRAJ_PERIOD_S = 0.02  # 50 Hz
+
     def __init__(self, plugin_config: dict, namespace: str, ros2):
         self._ns = namespace
         self._ros2 = ros2
@@ -2621,6 +2624,7 @@ class ArmPlugin:
         self._pos_publisher = None
         self._ctrl_publisher = None
         self._feedback = _JointCommandFeedback("arm", "/arm/status")
+        self._sequence = _ActionSequence("ArmPlugin")
 
     def get_tool(self) -> dict:
         return {
@@ -2628,36 +2632,65 @@ class ArmPlugin:
             "type": "actuator",
             "description": (
                 "控制左右手臂的各关节角度。不确定选哪个模式时，请使用move_pos："
-                "它适合抬手、弯肘、摆姿势和回到初始位置。move_ctrl是高级调试模式，"
-                "用于调整手臂保持姿势时有多用力、到位后是否容易晃动，以及已确认安全的"
-                "轻推柔顺实验；它不是慢速模式，不适合普通动作或大幅移动。"
+                "它适合抬手、弯肘、摆姿势和回到初始位置。需要执行一段连续动作（如太极、"
+                "舞蹈、连贯手势）时，请使用move_traj：一次传入完整路径点序列，驱动内部"
+                "按固定频率连续下发位置命令，避免多段move_pos之间的调度停顿。"
+                "move_ctrl是高级调试模式，用于调整手臂保持姿势时有多用力、到位后是否容易"
+                "晃动，以及已确认安全的轻推柔顺实验；它不是慢速模式，不适合普通动作或大幅移动。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["move_pos", "move_ctrl"],
+                    "action": {"type": "string", "enum": ["move_pos", "move_traj", "move_ctrl"],
                                "default": "move_pos",
                                "description": (
                                    "模式选择：抬手、弯肘、摆姿势、回零等普通操作选move_pos；"
+                                   "需要连续执行多段动作选move_traj；"
                                    "只有需要调节手臂保持力度或减少晃动时才选move_ctrl"
                                )},
                     "left_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
                         "default": [0, 0, 0, 0, 0, 0, 0],
-                        "description": "左臂实际7关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"
+                        "description": "move_pos/move_ctrl用：左臂实际7关节角度(度): [肩pitch, 肩roll, 肩yaw, 肘pitch, 腕yaw, 腕pitch, 腕roll]"
                     },
                     "right_positions": {
                         "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
                         "minItems": 7, "maxItems": 7,
                         "default": [0, 0, 0, 0, 0, 0, 0],
-                        "description": "右臂实际7关节角度(度)，顺序同左臂；若要镜像左臂姿态，请将肩roll、肩yaw、腕yaw、腕roll（索引1/2/4/6）取反"
+                        "description": "move_pos/move_ctrl用：右臂实际7关节角度(度)，顺序同左臂；若要镜像左臂姿态，请将肩roll、肩yaw、腕yaw、腕roll（索引1/2/4/6）取反"
+                    },
+                    "waypoints": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "left_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "该路径点左臂7关节角度(度)，顺序同move_pos"
+                                },
+                                "right_positions": {
+                                    "type": "array", "items": {"type": "number", "minimum": -170, "maximum": 170},
+                                    "minItems": 7, "maxItems": 7,
+                                    "description": "该路径点右臂7关节角度(度)，顺序同move_pos"
+                                },
+                                "time_from_start": {
+                                    "type": "number", "minimum": 0,
+                                    "description": "从轨迹起点到该路径点的时间(秒)，必须单调递增"
+                                },
+                            },
+                            "required": ["time_from_start"],
+                        },
+                        "description": "move_traj用：路径点序列，至少2个点，按time_from_start单调递增排序。每个点可只包含左臂、只包含右臂或双臂同时；未提供的手臂保持上一路径点的目标"
                     },
                     "speed": {"type": "number", "minimum": 0.2, "maximum": 1.5,
                               "default": 0.5,
                               "description": (
-                                  "仅move_pos使用：决定手臂移动到目标姿势时有多快。"
-                                  "范围[0.2,1.5]rad/s，默认0.5。move_ctrl不能用它来减速"
+                                  "move_pos/move_traj使用：move_pos决定手臂移动到目标姿势时有多快；"
+                                  "move_traj作为关节速度上限(rad/s)。"
+                                  "范围[0.2,1.5]，默认0.5。move_ctrl不能用它来减速"
                               )},
                     "kp": {"type": "array", "items": {"type": "number", "minimum": 10, "maximum": 200},
                            "minItems": 7, "maxItems": 7,
@@ -2684,6 +2717,12 @@ class ArmPlugin:
                                      "普通动作首选：填写左右臂目标角度和移动速度。适合抬手、弯肘、"
                                      "摆出指定姿势、回到初始位置，以及其他希望控制移动快慢的场景"
                                  )},
+                    "move_traj": {"params": ["waypoints", "speed"],
+                                  "description": (
+                                      "连续轨迹模式：一次传入2个及以上路径点，驱动内部以50Hz连续"
+                                      "下发位置命令，避免LLM调度多段move_pos造成的段间停顿。"
+                                      "适合太极、舞蹈、连贯手势等多段连续动作"
+                                  )},
                     "move_ctrl": {"params": ["left_positions", "right_positions", "kp", "kd"],
                                   "description": (
                                       "高级调试模式：目标角度决定手臂想停在哪里，KP决定偏离后拉回的"
@@ -2708,7 +2747,7 @@ class ArmPlugin:
             print(f"[ArmPlugin] WARNING: msg import failed ({e})")
 
     def stop(self):
-        pass
+        self._sequence.cancel()
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action == "move_pos":
@@ -2734,6 +2773,48 @@ class ArmPlugin:
             result["feedback_verified"] = True
             result["feedback"] = feedback
             return result
+        elif action == "move_traj":
+            speed = args.get("speed", 0.5)
+            validated = self._validate_waypoints(args, speed=speed)
+            if isinstance(validated, dict):
+                return validated
+            waypoints, speed = validated
+            motor_ids = self._motor_ids_for_waypoints(waypoints)
+            check = self._feedback.preflight(self._pos_publisher, motor_ids)
+            if check is not None:
+                return check
+            baseline_seq, baseline = self._feedback.snapshot(motor_ids)
+            from uuid import uuid4
+            action_id = f"arm_traj_{uuid4().hex[:8]}"
+            duration = waypoints[-1]["time_from_start"]
+
+            def on_done(cancelled):
+                if cancelled:
+                    _acp_notify(action_id, "cancelled",
+                                {"trajectory_duration_s": duration}, "arm")
+                else:
+                    _acp_notify(action_id, "completed",
+                                {"trajectory_duration_s": duration}, "arm")
+
+            def _worker(cancel_event: threading.Event):
+                self._run_traj(waypoints, speed, cancel_event)
+
+            self._sequence.start(_worker, on_done=on_done)
+            feedback = self._feedback.wait_for_motion(
+                self._target_positions_for_waypoint(waypoints[0]),
+                baseline_seq, baseline)
+            if feedback.get("state") == "error":
+                self._sequence.cancel()
+                return feedback
+            return {
+                "state": "running",
+                "action": "move_traj",
+                "action_id": action_id,
+                "trajectory_duration_s": duration,
+                "waypoints": len(waypoints),
+                "feedback_verified": True,
+                "feedback": feedback,
+            }
         elif action == "move_ctrl":
             poses = self._requested_poses(args)
             kp = args.get("kp", [self._DEFAULT_KP] * 7)
@@ -2759,6 +2840,10 @@ class ArmPlugin:
             result["feedback_verified"] = True
             result["feedback"] = feedback
             return result
+        elif action == "cancel":
+            cancelled = self._sequence.cancel()
+            return {"state": "cancelled" if cancelled else "idle",
+                    "cancelled": cancelled}
         elif action in ("start", "info"):
             return {
                 "state": "ready" if self._pos_publisher else "idle",
@@ -2768,6 +2853,7 @@ class ArmPlugin:
                 "independent_bilateral_positions": True,
             }
         elif action == "stop":
+            self._sequence.cancel()
             return {"state": "idle"}
         return {"error": f"unknown action: {action}"}
 
@@ -2820,6 +2906,193 @@ class ArmPlugin:
                 for index, deg in enumerate(poses["right"])
             })
         return targets
+
+    @classmethod
+    def _validate_waypoints(cls, args: dict, speed: float):
+        """Validate and normalize a trajectory waypoint list."""
+        waypoints = args.get("waypoints")
+        if waypoints is None:
+            return {"state": "error", "error": "waypoints is required for move_traj",
+                    "code": "missing_arm_waypoints"}
+        if isinstance(waypoints, str):
+            try:
+                waypoints = json.loads(waypoints)
+            except json.JSONDecodeError as exc:
+                return {"state": "error", "error": "waypoints must be a valid JSON array",
+                        "code": "invalid_arm_waypoints", "parse_error": str(exc)}
+        if not isinstance(waypoints, (list, tuple)) or len(waypoints) < 2:
+            return {"state": "error", "error": "waypoints must contain at least 2 points",
+                    "code": "invalid_arm_waypoints"}
+
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return {"state": "error", "error": "speed must be numeric",
+                    "code": "invalid_arm_speed"}
+        if not math.isfinite(speed) or speed < 0.2 or speed > 1.5:
+            return {"state": "error", "error": "speed must be in [0.2, 1.5] rad/s",
+                    "code": "arm_speed_out_of_range", "speed": speed}
+
+        normalized = []
+        previous = {"left": [0.0] * 7, "right": [0.0] * 7}
+        last_time = None
+        for index, point in enumerate(waypoints):
+            if not isinstance(point, dict):
+                return {"state": "error", "error": f"waypoint {index} must be an object",
+                        "code": "invalid_arm_waypoint", "index": index}
+            time_from_start = point.get("time_from_start")
+            try:
+                time_from_start = float(time_from_start)
+            except (TypeError, ValueError):
+                return {"state": "error",
+                        "error": f"waypoint {index} time_from_start must be numeric",
+                        "code": "invalid_arm_waypoint_time", "index": index}
+            if not math.isfinite(time_from_start) or time_from_start < 0:
+                return {"state": "error",
+                        "error": f"waypoint {index} time_from_start must be >= 0",
+                        "code": "invalid_arm_waypoint_time", "index": index}
+            if last_time is not None and time_from_start <= last_time:
+                return {"state": "error",
+                        "error": f"waypoint {index} time_from_start must be strictly increasing",
+                        "code": "invalid_arm_waypoint_time", "index": index,
+                        "time_from_start": time_from_start, "previous_time": last_time}
+            last_time = time_from_start
+
+            pose = {}
+            for side in ("left", "right"):
+                key = f"{side}_positions"
+                values = point.get(key)
+                if values is None:
+                    # Carry forward previous target for this arm.
+                    values = previous[side]
+                else:
+                    if isinstance(values, str):
+                        try:
+                            values = json.loads(values)
+                        except json.JSONDecodeError as exc:
+                            return {"state": "error",
+                                    "error": f"waypoint {index} {key} must be a valid JSON array",
+                                    "code": "invalid_arm_waypoint", "index": index,
+                                    "parse_error": str(exc)}
+                    if not isinstance(values, (list, tuple)) or len(values) != 7:
+                        return {"state": "error",
+                                "error": f"waypoint {index} {key} must have exactly 7 values",
+                                "code": "invalid_arm_waypoint", "index": index}
+                    try:
+                        values = [float(v) for v in values]
+                    except (TypeError, ValueError):
+                        return {"state": "error",
+                                "error": f"waypoint {index} {key} must be numeric",
+                                "code": "invalid_arm_waypoint", "index": index}
+                    if not all(math.isfinite(v) for v in values):
+                        return {"state": "error",
+                                "error": f"waypoint {index} {key} must be finite",
+                                "code": "invalid_arm_waypoint", "index": index}
+                pose[side] = values
+
+            violations = cls._pose_violations(pose)
+            if violations:
+                return {"state": "error",
+                        "error": f"waypoint {index} arm pose exceeds URDF joint limits",
+                        "code": "arm_pose_out_of_range", "index": index,
+                        "violations": violations}
+
+            normalized.append({
+                "time_from_start": time_from_start,
+                "left": list(pose["left"]),
+                "right": list(pose["right"]),
+            })
+            previous = pose
+
+        return normalized, speed
+
+    @staticmethod
+    def _motor_ids_for_waypoints(waypoints: list[dict]) -> list[int]:
+        ids = []
+        has_left = any(wp.get("left") is not None for wp in waypoints)
+        has_right = any(wp.get("right") is not None for wp in waypoints)
+        if has_left:
+            ids.extend(range(11, 18))
+        if has_right:
+            ids.extend(range(21, 28))
+        return ids or [*range(11, 18), *range(21, 28)]
+
+    @classmethod
+    def _target_positions_for_waypoint(
+            cls, waypoint: dict) -> dict[int, float]:
+        return cls._target_positions({
+            "left": waypoint["left"],
+            "right": waypoint["right"],
+        })
+
+    def _run_traj(self, waypoints: list[dict], speed: float,
+                  cancel_event: threading.Event) -> None:
+        """Publish interpolated set-points at 50 Hz until the trajectory ends."""
+        from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition
+        period = self._TRAJ_PERIOD_S
+        t0 = time.monotonic()
+        total_t = waypoints[-1]["time_from_start"]
+        index = 0
+        while index + 1 < len(waypoints) and not cancel_event.is_set():
+            t_now = time.monotonic() - t0
+            if t_now >= total_t:
+                break
+            # Locate current segment.
+            while index + 1 < len(waypoints) and t_now >= waypoints[index + 1]["time_from_start"]:
+                index += 1
+            if index + 1 >= len(waypoints):
+                break
+            wp_a = waypoints[index]
+            wp_b = waypoints[index + 1]
+            ta = wp_a["time_from_start"]
+            tb = wp_b["time_from_start"]
+            seg_dt = tb - ta
+            ratio = 0.0 if seg_dt <= 0 else _clamp((t_now - ta) / seg_dt, 0.0, 1.0)
+            # Segment speed: scale by the largest joint displacement so each
+            # joint has headroom to complete the segment on time.
+            max_delta = max(
+                abs(float(wp_b[side][i]) - float(wp_a[side][i]))
+                for side in ("left", "right")
+                for i in range(7)
+            )
+            seg_speed = min(speed, (max_delta / seg_dt) * 1.2) if seg_dt > 0 else speed
+            seg_speed = max(0.2, seg_speed)
+
+            msg = CmdSetMotorPosition()
+            msg.cmds = []
+            for base_id, side in ((11, "left"), (21, "right")):
+                for i in range(7):
+                    deg_a = float(wp_a[side][i])
+                    deg_b = float(wp_b[side][i])
+                    deg = deg_a + (deg_b - deg_a) * ratio
+                    motor_id = base_id + i
+                    cmd = SetMotorPosition()
+                    cmd.name = motor_id
+                    cmd.pos = _deg2rad(deg)
+                    cmd.spd = seg_speed
+                    cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
+                    msg.cmds.append(cmd)
+            self._pos_publisher.publish(msg)
+            # Sleep until next tick, accounting for publish overhead.
+            elapsed = time.monotonic() - t0 - t_now
+            sleep_t = max(0.0, period - elapsed)
+            if cancel_event.wait(sleep_t):
+                return
+        # Ensure the final waypoint is sent.
+        if not cancel_event.is_set():
+            final = waypoints[-1]
+            msg = CmdSetMotorPosition()
+            msg.cmds = []
+            for base_id, side in ((11, "left"), (21, "right")):
+                for i in range(7):
+                    motor_id = base_id + i
+                    cmd = SetMotorPosition()
+                    cmd.name = motor_id
+                    cmd.pos = _deg2rad(float(final[side][i]))
+                    cmd.spd = speed
+                    cmd.cur = _RATED_MOTOR_CURRENT_A[motor_id]
+                    msg.cmds.append(cmd)
+            self._pos_publisher.publish(msg)
 
     @staticmethod
     def _decode_array_argument(value, name: str):
